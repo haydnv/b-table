@@ -3,11 +3,14 @@ name = "b-table"
 version = "0.1.0"
 authors = ["code@tinychain.net"]
 edition = "2021"
-description = "A persistent database table based on b-tree, with a SQL-style API"
+description = "A persistent database table based on b-tree"
 license = "Apache-2.0"
 readme = "README.md"
-keywords = ["persistent", "ordered", "indexed", "table", "sql"]
+keywords = ["persistent", "ordered", "indexed", "relational", "table"]
 categories = ["database", "database-implementations", "data-structures"]
 
 [dependencies]
 b-tree = { path = "../b-tree" }
+freqfs = { path = "../freqfs" }
+futures = "0.3"
+safecast = { path = "../safecast" }
