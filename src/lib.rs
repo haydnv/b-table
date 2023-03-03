@@ -8,7 +8,7 @@ use std::{fmt, io};
 use b_tree::{BTree, BTreeLock, Key};
 use collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 use freqfs::{Dir, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
-use futures::stream::{self, Stream};
+use futures::stream::{self, Stream, TryStreamExt};
 use safecast::AsType;
 
 /// A node in a [`BTree`]
@@ -204,9 +204,8 @@ impl<S, C, FE, G> Table<S, S::Index, C, G>
 where
     S: Schema,
     C: Collate<Value = S::Value> + 'static,
-    FE: FileLoad + AsType<Node<S::Value>>,
+    FE: FileLoad + AsType<Node<Vec<Vec<S::Value>>>>,
     G: Deref<Target = Dir<FE>> + 'static,
-    Node<S::Value>: fmt::Debug,
 {
     /// Count how many rows in this [`Table`] lie within the given `range`.
     pub async fn count(&self, _range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
@@ -214,17 +213,20 @@ where
     }
 
     /// Return `true` if the given `key` is present in this [`Table`].
-    pub async fn contains(&self, key: Key<S::Value>) -> Result<bool, S::Error> {
-        let _key = self.schema.validate_key(key)?;
-
-        todo!()
+    pub async fn contains(&self, key: &Key<S::Value>) -> Result<bool, io::Error> {
+        self.primary.contains(key).await
     }
 
     /// Look up a row by its `key`.
     pub async fn get(&self, key: Key<S::Value>) -> Result<Option<Vec<S::Value>>, S::Error> {
-        let _key = self.schema.validate_key(key)?;
-
-        todo!()
+        let key = self.schema.validate_key(key)?;
+        let range = b_tree::Range::from_prefix(key);
+        let mut keys = self.primary.to_stream(&range);
+        if let Some(block) = keys.try_next().await? {
+            Ok(block.first().cloned())
+        } else {
+            Ok(None)
+        }
     }
 
     /// Construct a [`Stream`] of the values of the `columns` of the rows within the given `range`.
