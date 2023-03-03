@@ -11,6 +11,7 @@ categories = ["database", "database-implementations", "data-structures"]
 
 [dependencies]
 b-tree = { path = "../b-tree" }
+collate = { path = "../collate" }
 freqfs = { path = "../freqfs" }
 futures = "0.3"
 safecast = { path = "../safecast" }

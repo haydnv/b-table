@@ -1,10 +1,12 @@
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::ops::Deref;
+use std::ops::{Bound, Deref};
 use std::sync::Arc;
 use std::{fmt, io};
 
-use b_tree::{BTree, BTreeLock, Collate};
+use b_tree::{BTree, BTreeLock, Key};
+use collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 use freqfs::{Dir, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
 use futures::stream::{self, Stream};
 use safecast::AsType;
@@ -44,7 +46,33 @@ pub trait Schema {
 /// A range on a single column
 pub enum ColumnRange<V> {
     Eq(V),
-    In(std::ops::Range<V>),
+    In((Bound<V>, Bound<V>)),
+}
+
+impl<C> OverlapsRange<Self, C> for ColumnRange<C::Value>
+where
+    C: Collate,
+    C::Value: fmt::Debug,
+    std::ops::Range<C::Value>: OverlapsRange<std::ops::Range<C::Value>, C>,
+{
+    fn overlaps(&self, other: &Self, collator: &C) -> Overlap {
+        match (self, other) {
+            (Self::Eq(this), Self::Eq(that)) => match collator.cmp(this, that) {
+                Ordering::Less => Overlap::Less,
+                Ordering::Equal => Overlap::Equal,
+                Ordering::Greater => Overlap::Greater,
+            },
+            (Self::In(this), Self::Eq(that)) => this.overlaps_value(that, collator),
+            (Self::Eq(this), Self::In(that)) => match that.overlaps_value(this, collator) {
+                Overlap::Less => Overlap::Greater,
+                Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => Overlap::Narrow,
+                Overlap::Greater => Overlap::Less,
+                Overlap::Equal => Overlap::Equal,
+                Overlap::Narrow => unreachable!("{:?} is narrower than {:?}", that, this),
+            },
+            (Self::In(this), Self::In(that)) => this.overlaps(that, collator),
+        }
+    }
 }
 
 /// A range used in a where condition
@@ -57,6 +85,61 @@ impl<K, V> Default for Range<K, V> {
         Self {
             columns: HashMap::with_capacity(0),
         }
+    }
+}
+
+impl<K, V> Range<K, V> {
+    /// Return `true` if this [`Range`] has no bounds.
+    pub fn is_default(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    /// Get the number of columns specified by this range.
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+}
+
+impl<K: Eq + Hash, V> Range<K, V> {
+    /// Get a [`ColumnRange`] in this range, if specified.
+    pub fn get(&self, column: &K) -> Option<&ColumnRange<V>> {
+        self.columns.get(column)
+    }
+}
+
+impl<C, K> OverlapsRange<Self, C> for Range<K, C::Value>
+where
+    K: Eq + Hash,
+    C: Collate,
+    C::Value: fmt::Debug,
+{
+    fn overlaps(&self, other: &Self, collator: &C) -> Overlap {
+        let mut overlap: Option<Overlap> = None;
+
+        // handle the case that there is a column absent in this range but not the other
+        for name in other.columns.keys() {
+            if !self.columns.contains_key(name) {
+                return Overlap::Wide;
+            }
+        }
+
+        for (name, this) in &self.columns {
+            let column_overlap = other
+                .columns
+                .get(name)
+                .map(|that| this.overlaps(that, collator))
+                // handle the case that there is a column present in this range but not the other
+                .unwrap_or(Overlap::Narrow);
+
+            if let Some(overlap) = overlap.as_mut() {
+                *overlap = overlap.then(column_overlap);
+            } else {
+                overlap = Some(column_overlap);
+            }
+        }
+
+        // handle the case that both ranges are empty
+        overlap.unwrap_or(Overlap::Equal)
     }
 }
 
@@ -126,7 +209,21 @@ where
     Node<S::Value>: fmt::Debug,
 {
     /// Count how many rows in this [`Table`] lie within the given `range`.
-    pub fn count(&self, _range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
+    pub async fn count(&self, _range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
+        todo!()
+    }
+
+    /// Return `true` if the given `key` is present in this [`Table`].
+    pub async fn contains(&self, key: Key<S::Value>) -> Result<bool, S::Error> {
+        let _key = self.schema.validate_key(key)?;
+
+        todo!()
+    }
+
+    /// Look up a row by its `key`.
+    pub async fn get(&self, key: Key<S::Value>) -> Result<Option<Vec<S::Value>>, S::Error> {
+        let _key = self.schema.validate_key(key)?;
+
         todo!()
     }
 
