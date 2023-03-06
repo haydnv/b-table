@@ -8,6 +8,7 @@ use std::{fmt, io};
 use b_tree::{BTree, BTreeLock, Key};
 use collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 use freqfs::{Dir, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
+use futures::future::{try_join_all, TryFutureExt};
 use futures::stream::{self, Stream, TryStreamExt};
 use safecast::AsType;
 
@@ -64,10 +65,14 @@ where
             },
             (Self::In(this), Self::Eq(that)) => this.overlaps_value(that, collator),
             (Self::Eq(this), Self::In(that)) => match that.overlaps_value(this, collator) {
-                Overlap::Less => Overlap::Greater,
-                Overlap::WideLess | Overlap::Wide | Overlap::WideGreater => Overlap::Narrow,
-                Overlap::Greater => Overlap::Less,
                 Overlap::Equal => Overlap::Equal,
+
+                Overlap::Less => Overlap::Greater,
+                Overlap::WideLess => Overlap::WideGreater,
+                Overlap::Wide => Overlap::Narrow,
+                Overlap::WideGreater => Overlap::WideLess,
+                Overlap::Greater => Overlap::Less,
+
                 Overlap::Narrow => unreachable!("{:?} is narrower than {:?}", that, this),
             },
             (Self::In(this), Self::In(that)) => this.overlaps(that, collator),
@@ -213,8 +218,10 @@ where
     }
 
     /// Return `true` if the given `key` is present in this [`Table`].
-    pub async fn contains(&self, key: &Key<S::Value>) -> Result<bool, io::Error> {
-        self.primary.contains(key).await
+    pub async fn contains(&self, key: Key<S::Value>) -> Result<bool, S::Error> {
+        let key = self.schema.validate_key(key)?;
+        let range = b_tree::Range::from_prefix(key);
+        self.primary.is_empty(&range).map_ok(|empty| !empty).await
     }
 
     /// Look up a row by its `key`.
@@ -245,14 +252,33 @@ impl<S, C, FE> Table<S, S::Index, C, DirWriteGuardOwned<FE>>
 where
     S: Schema,
     C: Collate<Value = S::Value> + 'static,
-    FE: FileLoad + AsType<Node<S::Value>>,
+    FE: FileLoad + AsType<Node<Vec<Vec<S::Value>>>>,
     Node<S::Value>: fmt::Debug,
 {
     /// Delete a row from this [`Table`] by its `key`.
     /// Returns `true` if the given `key` was present.
     pub async fn delete(&mut self, key: Vec<S::Value>) -> Result<bool, S::Error> {
-        let _key = self.schema.validate_key(key)?;
-        todo!()
+        let key = self.schema.validate_key(key)?;
+        let row = if let Some(row) = self.get(key).await? {
+            row
+        } else {
+            return Ok(false);
+        };
+
+        let mut deletes = Vec::with_capacity(self.auxiliary.len() + 1);
+
+        for index in &mut self.auxiliary {
+            let row = b_tree::Schema::extract_key(self.schema.primary(), &row, index.schema());
+            deletes.push(index.delete(row));
+        }
+
+        deletes.push(self.primary.delete(row));
+
+        for present in try_join_all(deletes).await? {
+            assert!(present, "table index is out of sync");
+        }
+
+        Ok(true)
     }
 
     /// Insert or update a row in this [`Table`].
@@ -262,9 +288,27 @@ where
         key: Vec<S::Value>,
         values: Vec<S::Value>,
     ) -> Result<bool, S::Error> {
-        let _key = self.schema.validate_key(key)?;
-        let _values = self.schema.validate_values(values)?;
+        let key = self.schema.validate_key(key)?;
+        let values = self.schema.validate_values(values)?;
 
-        todo!()
+        let mut row = key;
+        row.extend(values);
+
+        let mut inserts = Vec::with_capacity(self.auxiliary.len() + 1);
+
+        for index in &mut self.auxiliary {
+            let row = b_tree::Schema::extract_key(self.schema.primary(), &row, index.schema());
+            inserts.push(index.insert(row));
+        }
+
+        inserts.push(self.primary.insert(row));
+
+        let mut inserts = try_join_all(inserts).await?;
+        let new = inserts.pop().expect("insert");
+        while let Some(index_new) = inserts.pop() {
+            assert_eq!(new, index_new, "index out of sync");
+        }
+
+        Ok(new)
     }
 }
