@@ -23,12 +23,20 @@ pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, DirReadGuardOwned<FE>>;
 /// A write guard acquired on a [`TableLock`]
 pub type TableWriteGuard<S, IS, C, FE> = Table<S, IS, C, DirWriteGuardOwned<FE>>;
 
+/// The schema of a [`Table`] index
+pub trait IndexSchema: b_tree::Schema + Clone {
+    /// Given a key matching this [`Schema`], extract a key matching the `other` [`Schema`].
+    /// This values in `key` must be in order, but the values in `other` may be in any order.
+    /// Panics: if `other` is not a subset of `self`.
+    fn extract_key(&self, key: &[Self::Value], other: &Self) -> Key<Self::Value>;
+}
+
 /// The schema of a [`Table`]
 pub trait Schema {
     type Id: Hash + Eq;
     type Error: std::error::Error + From<io::Error>;
     type Value: Clone + Eq + fmt::Debug + 'static;
-    type Index: b_tree::Schema<Error = Self::Error, Value = Self::Value> + Clone;
+    type Index: IndexSchema<Error = Self::Error, Value = Self::Value>;
 
     /// Borrow the schema of the primary index.
     fn primary(&self) -> &Self::Index;
@@ -326,7 +334,7 @@ where
         let mut deletes = Vec::with_capacity(self.auxiliary.len() + 1);
 
         for index in &mut self.auxiliary {
-            let row = b_tree::Schema::extract_key(self.schema.primary(), &row, index.schema());
+            let row = IndexSchema::extract_key(self.schema.primary(), &row, index.schema());
             deletes.push(index.delete(row));
         }
 
@@ -355,7 +363,7 @@ where
         let mut inserts = Vec::with_capacity(self.auxiliary.len() + 1);
 
         for index in &mut self.auxiliary {
-            let row = b_tree::Schema::extract_key(self.schema.primary(), &row, index.schema());
+            let row = IndexSchema::extract_key(self.schema.primary(), &row, index.schema());
             inserts.push(index.insert(row));
         }
 

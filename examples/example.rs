@@ -119,24 +119,6 @@ impl b_tree::Schema for IndexSchema {
         BLOCK_SIZE
     }
 
-    fn extract_key(&self, key: &[Self::Value], other: &Self) -> Key<Self::Value> {
-        assert_eq!(key.len(), self.len());
-
-        let mut other_key = Vec::with_capacity(other.len());
-        for i in 0..other.len() {
-            let column = &other.columns[i];
-            for j in 0..self.len() {
-                if column == &self.columns[j] {
-                    other_key.push(key[j].clone());
-                }
-            }
-        }
-
-        debug_assert_eq!(other_key.len(), other.len());
-
-        other_key
-    }
-
     fn len(&self) -> usize {
         self.columns.len()
     }
@@ -154,6 +136,28 @@ impl b_tree::Schema for IndexSchema {
                 "wrong number of values",
             ))
         }
+    }
+}
+
+impl b_table::IndexSchema for IndexSchema {
+    fn extract_key(&self, key: &[Self::Value], other: &Self) -> Key<Self::Value> {
+        use b_tree::Schema;
+
+        assert_eq!(key.len(), self.len());
+
+        let mut other_key = Vec::with_capacity(other.len());
+        for i in 0..other.len() {
+            let column = &other.columns[i];
+            for j in 0..self.len() {
+                if column == &self.columns[j] {
+                    other_key.push(key[j].clone());
+                }
+            }
+        }
+
+        debug_assert_eq!(other_key.len(), other.len());
+
+        other_key
     }
 }
 
@@ -263,13 +267,27 @@ async fn main() -> Result<(), io::Error> {
 
         assert!(
             guard
-                .upsert(vec![1.into()], vec!["one".to_string().into(), 9.into(), "nine".to_string().into()])
+                .upsert(
+                    vec![1.into()],
+                    vec![
+                        "one".to_string().into(),
+                        9.into(),
+                        "nine".to_string().into()
+                    ]
+                )
                 .await?
         );
 
         assert!(
             !guard
-                .upsert(vec![1.into()], vec!["one".to_string().into(), 9.into(), "nine".to_string().into()])
+                .upsert(
+                    vec![1.into()],
+                    vec![
+                        "one".to_string().into(),
+                        9.into(),
+                        "nine".to_string().into()
+                    ]
+                )
                 .await?
         );
 
