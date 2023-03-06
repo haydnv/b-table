@@ -1,7 +1,69 @@
 use std::io;
+use std::path::Path;
 
-use b_tree::Key;
+use async_trait::async_trait;
+use b_tree::{Key, Node};
+use bytes::Bytes;
+use destream::{de, en};
 use destream_json::Value;
+use freqfs::FileLoad;
+use futures::{TryFutureExt, TryStreamExt};
+use safecast::as_type;
+use tokio::fs;
+use tokio_util::io::StreamReader;
+
+const BLOCK_SIZE: usize = 4_096;
+
+enum File {
+    Node(Node<Vec<Key<i16>>>),
+}
+
+#[async_trait]
+impl de::FromStream for File {
+    type Context = ();
+
+    async fn from_stream<D: de::Decoder>(cxt: (), decoder: &mut D) -> Result<Self, D::Error> {
+        Node::from_stream(cxt, decoder).map_ok(Self::Node).await
+    }
+}
+
+impl<'en> en::ToStream<'en> for File {
+    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
+        match self {
+            Self::Node(node) => node.to_stream(encoder),
+        }
+    }
+}
+
+as_type!(File, Node, Node<Vec<Key<i16>>>);
+
+#[async_trait]
+impl FileLoad for File {
+    async fn load(
+        _path: &Path,
+        file: fs::File,
+        _metadata: std::fs::Metadata,
+    ) -> Result<Self, io::Error> {
+        destream_json::de::read_from((), file)
+            .map_err(|cause| io::Error::new(io::ErrorKind::InvalidData, cause))
+            .await
+    }
+
+    async fn save(&self, file: &mut fs::File) -> Result<u64, io::Error> {
+        let encoded = destream_json::en::encode(self)
+            .map_err(|cause| io::Error::new(io::ErrorKind::InvalidData, cause))?;
+
+        let mut reader = StreamReader::new(
+            encoded
+                .map_ok(Bytes::from)
+                .map_err(|cause| io::Error::new(io::ErrorKind::InvalidData, cause)),
+        );
+
+        let size = tokio::io::copy(&mut reader, file).await?;
+        assert!(size > 0);
+        Ok(size)
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 struct IndexSchema {
@@ -13,7 +75,7 @@ impl b_tree::Schema for IndexSchema {
     type Value = Value;
 
     fn block_size(&self) -> usize {
-        4_096
+        BLOCK_SIZE
     }
 
     fn extract_key(&self, key: &[Self::Value], other: &Self) -> Key<Self::Value> {
