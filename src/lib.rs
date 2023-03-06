@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::ops::{Bound, Deref};
 use std::sync::Arc;
@@ -11,6 +11,8 @@ use freqfs::{Dir, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
 use futures::future::{try_join_all, TryFutureExt};
 use futures::stream::{self, Stream, TryStreamExt};
 use safecast::AsType;
+
+const PRIMARY: &str = "primary";
 
 /// A node in a [`BTree`]
 pub use b_tree::Node;
@@ -26,13 +28,15 @@ pub trait Schema {
     type Id: Hash + Eq;
     type Error: std::error::Error + From<io::Error>;
     type Value: Clone + Eq + fmt::Debug + 'static;
-    type Index: b_tree::Schema<Error = Self::Error, Value = Self::Value>;
+    type Index: b_tree::Schema<Error = Self::Error, Value = Self::Value> + Clone;
 
     /// Borrow the schema of the primary index.
     fn primary(&self) -> &Self::Index;
 
     /// Borrow the schemata of the auxiliary indices.
-    fn auxiliary(&self) -> &[Self::Index];
+    /// This is a [`BTreeMap`] rather than a [`HashMap`]
+    /// because this [`Schema`] type should have a consistent hash.
+    fn auxiliary(&self) -> &BTreeMap<String, Self::Index>;
 
     /// Check that the given `key` is a valid primary key for a [`Table`] with this [`Schema`].
     fn validate_key(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error>;
@@ -150,7 +154,7 @@ pub struct TableLock<S, IS, C, FE> {
     schema: Arc<S>,
     dir: DirLock<FE>,
     primary: BTreeLock<IS, C, FE>,
-    auxiliary: Vec<BTreeLock<IS, C, FE>>,
+    auxiliary: HashMap<String, BTreeLock<IS, C, FE>>,
 }
 
 impl<S, IS, C, FE> Clone for TableLock<S, IS, C, FE> {
@@ -171,10 +175,39 @@ impl<S, IS, C, FE> TableLock<S, IS, C, FE> {
     }
 }
 
-impl<S: Schema, C, FE> TableLock<S, S::Index, C, FE> {
+impl<S, C, FE> TableLock<S, S::Index, C, FE>
+where
+    S: Schema,
+    C: Clone,
+    FE: FileLoad + AsType<Node<Vec<Key<S::Value>>>>,
+{
     /// Create a new [`Table`]
-    pub fn create(_schema: S, _collator: C, _dir: DirLock<FE>) -> Self {
-        todo!()
+    pub fn create(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
+        let mut dir_contents = dir.try_write()?;
+
+        let primary = {
+            let dir = dir_contents.create_dir(PRIMARY.to_string())?;
+            BTreeLock::create(schema.primary().clone(), collator.clone(), dir)
+        }?;
+
+        let mut auxiliary = HashMap::with_capacity(schema.auxiliary().len());
+        for (name, schema) in schema.auxiliary() {
+            let index = {
+                let dir = dir_contents.create_dir(name.to_string())?;
+                BTreeLock::create(schema.clone(), collator.clone(), dir)
+            }?;
+
+            auxiliary.insert(name.clone(), index);
+        }
+
+        std::mem::drop(dir_contents);
+
+        Ok(Self {
+            schema: Arc::new(schema),
+            primary,
+            auxiliary,
+            dir,
+        })
     }
 
     /// Load an existing [`Table`] with the given `schema` from the given `dir`
