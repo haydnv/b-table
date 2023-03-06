@@ -15,3 +15,7 @@ collate = { path = "../collate" }
 freqfs = { path = "../freqfs" }
 futures = "0.3"
 safecast = { path = "../safecast" }
+
+[dev-dependencies]
+destream_json = { version = "0.10", features=["tokio-io", "value"] }
+tokio = { version = "1.25", features = ["macros"] }

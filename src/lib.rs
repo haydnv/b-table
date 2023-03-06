@@ -28,20 +28,17 @@ pub trait Schema {
     type Value: Clone + Eq + fmt::Debug + 'static;
     type Index: b_tree::Schema<Error = Self::Error, Value = Self::Value>;
 
-    /// List the columns of a [`Table`]
-    fn columns(&self) -> &[Self::Id];
-
-    /// Borrow the schema of the primary key
+    /// Borrow the schema of the primary index.
     fn primary(&self) -> &Self::Index;
 
-    /// Borrow the schemata of the auxiliary keys
+    /// Borrow the schemata of the auxiliary indices.
     fn auxiliary(&self) -> &[Self::Index];
 
-    /// Check that the given `key` is a valid primary key
+    /// Check that the given `key` is a valid primary key for a [`Table`] with this [`Schema`].
     fn validate_key(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error>;
 
-    /// Check that the given `values` are valid for a row in a table
-    fn validate_values(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error>;
+    /// Check that the given `values` are valid for a row in a [`Table`] with this [`Schema`].
+    fn validate_values(&self, values: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error>;
 }
 
 /// A range on a single column
