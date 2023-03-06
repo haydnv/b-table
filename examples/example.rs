@@ -4,7 +4,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use b_table::TableLock;
+use b_table::{Range, TableLock};
 use b_tree::{Key, Node};
 use bytes::Bytes;
 use collate::Collate;
@@ -248,7 +248,42 @@ async fn main() -> Result<(), io::Error> {
     );
 
     // create the table
-    let _table = TableLock::create(schema, Collator::new(), dir);
+    let table = TableLock::create(schema, Collator::new(), dir)?;
 
-    todo!()
+    let default_range = Range::default();
+
+    {
+        let guard = table.read().await;
+        assert_eq!(guard.count(&default_range).await?, 0);
+        assert!(guard.is_empty(&default_range).await?);
+    }
+
+    {
+        let mut guard = table.write().await;
+
+        assert!(
+            guard
+                .upsert(vec![1.into()], vec!["one".to_string().into(), 9.into(), "nine".to_string().into()])
+                .await?
+        );
+
+        assert!(
+            !guard
+                .upsert(vec![1.into()], vec!["one".to_string().into(), 9.into(), "nine".to_string().into()])
+                .await?
+        );
+
+        assert_eq!(guard.count(&default_range).await?, 1);
+        assert!(!guard.is_empty(&default_range).await?);
+
+        guard.delete(vec![1.into()]).await?;
+    }
+
+    {
+        let guard = table.read().await;
+        assert_eq!(guard.count(&default_range).await?, 0);
+        assert!(guard.is_empty(&default_range).await?);
+    }
+
+    fs::remove_dir_all(path).await
 }

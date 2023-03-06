@@ -8,7 +8,7 @@ use std::{fmt, io};
 use b_tree::{BTree, BTreeLock, Key};
 use collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 use freqfs::{Dir, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
-use futures::future::{try_join_all, TryFutureExt};
+use futures::future::{join_all, try_join_all, TryFutureExt};
 use futures::stream::{self, Stream, TryStreamExt};
 use safecast::AsType;
 
@@ -216,15 +216,25 @@ where
     }
 }
 
-impl<S: Schema, C, FE> TableLock<S, S::Index, C, FE> {
+impl<S: Schema, C, FE: FileLoad> TableLock<S, S::Index, C, FE> {
     /// Lock this [`Table`] for reading
     pub async fn read(&self) -> TableReadGuard<S, S::Index, C, FE> {
-        todo!()
+        // lock the primary key first, separately from the indices, to avoid a deadlock
+        Table {
+            schema: self.schema.clone(),
+            primary: self.primary.read().await,
+            auxiliary: join_all(self.auxiliary.values().map(|index| index.read())).await,
+        }
     }
 
     /// Lock this [`Table`] for writing
     pub async fn write(&self) -> TableWriteGuard<S, S::Index, C, FE> {
-        todo!()
+        // lock the primary key first, separately from the indices, to avoid a deadlock
+        Table {
+            schema: self.schema.clone(),
+            primary: self.primary.write().await,
+            auxiliary: join_all(self.auxiliary.values().map(|index| index.write())).await,
+        }
     }
 }
 
@@ -243,15 +253,24 @@ where
     G: Deref<Target = Dir<FE>> + 'static,
 {
     /// Count how many rows in this [`Table`] lie within the given `range`.
-    pub async fn count(&self, _range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
-        todo!()
+    pub async fn count(&self, range: &Range<S::Id, S::Value>) -> Result<u64, io::Error> {
+        if range.is_default() {
+            self.primary.count(&b_tree::Range::default()).await
+        } else {
+            todo!("Table::count")
+        }
     }
 
     /// Return `true` if the given `key` is present in this [`Table`].
     pub async fn contains(&self, key: Key<S::Value>) -> Result<bool, S::Error> {
         let key = self.schema.validate_key(key)?;
         let range = b_tree::Range::from_prefix(key);
-        self.primary.is_empty(&range).map_ok(|empty| !empty).await
+
+        self.primary
+            .is_empty(&range)
+            .map_ok(|empty| !empty)
+            .map_err(S::Error::from)
+            .await
     }
 
     /// Look up a row by its `key`.
@@ -263,6 +282,15 @@ where
             Ok(block.first().cloned())
         } else {
             Ok(None)
+        }
+    }
+
+    /// Return `true` if the given [`Range`] of this [`Table`] does not contain any rows.
+    pub async fn is_empty(&self, range: &Range<S::Id, S::Value>) -> Result<bool, io::Error> {
+        if range.is_default() {
+            self.primary.is_empty(&b_tree::Range::default()).await
+        } else {
+            todo!("Table::is_empty")
         }
     }
 
