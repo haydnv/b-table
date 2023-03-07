@@ -265,6 +265,20 @@ async fn main() -> Result<(), io::Error> {
         ],
     );
 
+    let row1 = vec![
+        1.into(),
+        "one".to_string().into(),
+        9.into(),
+        "nine".to_string().into(),
+    ];
+
+    let row2 = vec![
+        2.into(),
+        "two".to_string().into(),
+        8.into(),
+        "eight".to_string().into(),
+    ];
+
     // create the table
     let table = TableLock::create(schema, Collator::new(), dir)?;
 
@@ -283,14 +297,10 @@ async fn main() -> Result<(), io::Error> {
     {
         let mut guard = table.write().await;
 
-        let key = vec![1.into()];
-        let values = vec![
-            "one".to_string().into(),
-            9.into(),
-            "nine".to_string().into(),
-        ];
+        let key = row1[..1].to_vec();
+        let values = row1[1..].to_vec();
 
-        assert!(guard.upsert(key.to_vec(), values.to_vec()).await?);
+        assert!(guard.upsert(key.clone(), values.clone()).await?);
         assert!(!guard.upsert(key, values).await?);
 
         assert_eq!(guard.count(Default::default()).await?, 1);
@@ -307,19 +317,41 @@ async fn main() -> Result<(), io::Error> {
         let range = Range::from_iter([("up".to_string(), Value::Number(2.into()))]);
         assert_eq!(guard.count(range.clone()).await?, 0);
         assert!(guard.is_empty(range).await?);
+
+        let key = row2[..1].to_vec();
+        let values = row2[1..].to_vec();
+
+        assert!(guard.upsert(key.clone(), values.clone()).await?);
+        assert!(!guard.upsert(key, values).await?);
+
+        assert_eq!(guard.count(Default::default()).await?, 2);
+
+        let range = Range::from_iter([("up".to_string(), Value::Number(2.into()))]);
+        assert_eq!(guard.count(range.clone()).await?, 1);
+        assert!(!guard.is_empty(range).await?);
+
+        let range = Range::from_iter([("up_name".to_string(), Value::String("two".to_string()))]);
+        assert_eq!(guard.count(range.clone()).await?, 1);
+        assert!(!guard.is_empty(range).await?);
+
+        let range = Range::from_iter([("up".to_string(), Value::Number(2.into()))]);
+        assert_eq!(guard.count(range.clone()).await?, 1);
+        assert!(!guard.is_empty(range).await?);
+
+        let range = Range::from_iter([(
+            "up".to_string(),
+            (Bound::Included(1.into()), Bound::Excluded(5.into())),
+        )]);
+
+        assert_eq!(guard.count(range.clone()).await?, 2);
+        assert!(!guard.is_empty(range).await?);
     }
 
     {
         let mut stream = table.clone().into_stream(Range::default(), false).await?;
 
-        let row = vec![
-            1.into(),
-            "one".to_string().into(),
-            9.into(),
-            "nine".to_string().into(),
-        ];
-
-        assert_eq!(stream.try_next().await?, Some(row.to_vec()));
+        assert_eq!(stream.try_next().await?, Some(row1.clone()));
+        assert_eq!(stream.try_next().await?, Some(row2.clone()));
         assert_eq!(stream.try_next().await?, None);
 
         let range = Range::from_iter([(
@@ -328,7 +360,8 @@ async fn main() -> Result<(), io::Error> {
         )]);
 
         let mut stream = table.clone().into_stream(range, true).await?;
-        assert_eq!(stream.try_next().await?, Some(row));
+        assert_eq!(stream.try_next().await?, Some(row1.clone()));
+        assert_eq!(stream.try_next().await?, Some(row2.clone()));
         assert_eq!(stream.try_next().await?, None);
     }
 
@@ -337,10 +370,22 @@ async fn main() -> Result<(), io::Error> {
 
         let guard = table.read().await;
 
+        assert_eq!(guard.count(Default::default()).await?, 1);
+
+        let range = Range::from_iter([("up".to_string(), Value::Number(1.into()))]);
+        assert_eq!(guard.count(range.clone()).await?, 0);
+        assert!(guard.is_empty(range).await?);
+    }
+
+    {
+        table.write().await.delete(vec![2.into()]).await?;
+
+        let guard = table.read().await;
+
         assert_eq!(guard.count(Default::default()).await?, 0);
         assert!(guard.is_empty(Default::default()).await?);
 
-        let range = Range::from_iter([("up".to_string(), Value::Number(1.into()))]);
+        let range = Range::from_iter([("up".to_string(), Value::Number(2.into()))]);
         assert_eq!(guard.count(range.clone()).await?, 0);
         assert!(guard.is_empty(range).await?);
     }
