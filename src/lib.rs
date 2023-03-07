@@ -365,8 +365,38 @@ where
     }
 
     /// Load an existing [`Table`] with the given `schema` from the given `dir`
-    pub fn load(_schema: S, _collator: C, _dir: DirLock<FE>) -> Self {
-        todo!()
+    pub fn load(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
+        let dir_contents = dir.try_read()?;
+
+        let primary = {
+            let dir = dir_contents
+                .get_dir(PRIMARY)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "primary table index"))?;
+
+            BTreeLock::load(schema.primary().clone(), collator.clone(), dir.clone())
+        }?;
+
+        let mut auxiliary = HashMap::with_capacity(schema.auxiliary().len());
+        for (name, schema) in schema.auxiliary() {
+            let index = {
+                let dir = dir_contents.get_dir(name).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, format!("table index {}", name))
+                })?;
+
+                BTreeLock::load(schema.clone(), collator.clone(), dir.clone())
+            }?;
+
+            auxiliary.insert(name.clone(), index);
+        }
+
+        std::mem::drop(dir_contents);
+
+        Ok(Self {
+            schema: Arc::new(schema),
+            primary,
+            auxiliary,
+            dir,
+        })
     }
 }
 

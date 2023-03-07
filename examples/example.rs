@@ -307,8 +307,7 @@ async fn main() -> Result<(), io::Error> {
         assert_eq!(guard.count(range.clone()).await?, 1);
         assert!(!guard.is_empty(range).await?);
 
-        let range =
-            Range::from_iter([("up_name".to_string(), Value::String("one".to_string()))]);
+        let range = Range::from_iter([("up_name".to_string(), Value::String("one".to_string()))]);
         assert_eq!(guard.count(range.clone()).await?, 1);
         assert!(!guard.is_empty(range).await?);
 
