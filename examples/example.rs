@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::io;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -193,6 +194,14 @@ impl b_table::Schema for Schema {
     type Value = Value;
     type Index = IndexSchema;
 
+    fn key(&self) -> &[Self::Id] {
+        &self.primary.columns[..1]
+    }
+
+    fn values(&self) -> &[Self::Id] {
+        &self.primary.columns[1..]
+    }
+
     fn primary(&self) -> &Self::Index {
         &self.primary
     }
@@ -251,8 +260,8 @@ async fn main() -> Result<(), io::Error> {
     let schema = Schema::new(
         vec!["up", "up_name", "down", "down_name"],
         [
-            ("up_name".into(), vec!["up_name"]),
-            ("down".into(), vec!["down"]),
+            ("up_name".into(), vec!["up_name", "up"]),
+            ("down".into(), vec!["down", "up"]),
         ],
     );
 
@@ -301,7 +310,7 @@ async fn main() -> Result<(), io::Error> {
     }
 
     {
-        let mut stream = table.read().await.into_stream(Range::default(), false)?;
+        let mut stream = table.clone().into_stream(Range::default(), false).await?;
 
         let row = vec![
             1.into(),
@@ -310,6 +319,15 @@ async fn main() -> Result<(), io::Error> {
             "nine".to_string().into(),
         ];
 
+        assert_eq!(stream.try_next().await?, Some(row.to_vec()));
+        assert_eq!(stream.try_next().await?, None);
+
+        let range = Range::from_iter([(
+            "down".to_string().into(),
+            (Bound::Unbounded, Bound::Excluded(10.into())),
+        )]);
+
+        let mut stream = table.clone().into_stream(range, true).await?;
         assert_eq!(stream.try_next().await?, Some(row));
         assert_eq!(stream.try_next().await?, None);
     }

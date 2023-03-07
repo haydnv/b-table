@@ -102,6 +102,12 @@ pub trait Schema {
     type Value: Clone + Eq + fmt::Debug + 'static;
     type Index: IndexSchema<Error = Self::Error, Id = Self::Id, Value = Self::Value> + 'static;
 
+    /// Borrow the names of the columns in the primary key.
+    fn key(&self) -> &[Self::Id];
+
+    /// Borrow the names of the value columns.
+    fn values(&self) -> &[Self::Id];
+
     /// Borrow the schema of the primary index.
     fn primary(&self) -> &Self::Index;
 
@@ -338,6 +344,15 @@ where
 {
     /// Create a new [`Table`]
     pub fn create(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
+        for (_name, index) in schema.auxiliary() {
+            if !index.columns().ends_with(schema.key()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "index columns must end with the primary key of the table",
+                ));
+            }
+        }
+
         let mut dir_contents = dir.try_write()?;
 
         let primary = {
@@ -367,6 +382,15 @@ where
 
     /// Load an existing [`Table`] with the given `schema` from the given `dir`
     pub fn load(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
+        for (_name, index) in schema.auxiliary() {
+            if !index.columns().ends_with(schema.key()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "index columns must end with the primary key of the table",
+                ));
+            }
+        }
+
         let dir_contents = dir.try_read()?;
 
         let primary = {
@@ -423,6 +447,62 @@ impl<S: Schema, C, FE: FileLoad> TableLock<S, S::Index, C, FE> {
     }
 }
 
+impl<S, C, FE> TableLock<S, S::Index, C, FE>
+where
+    S: Schema,
+    C: Collate<Value = S::Value> + 'static,
+    FE: FileLoad + AsType<Node<Vec<Key<S::Value>>>>,
+    Range<S::Id, S::Value>: fmt::Debug,
+{
+    /// Construct a [`Stream`] of the values of the `columns` of the rows within the given `range`.
+    pub async fn into_stream(
+        self,
+        range: Range<S::Id, S::Value>,
+        reverse: bool,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<S::Value>, io::Error>>>>, io::Error> {
+        if self.primary.schema().supports(&range) {
+            let range = self.primary.schema().extract_range(range).expect("range");
+            let index = self.primary.read().await;
+            let stream = index.into_stream(range, reverse);
+            return Ok(Box::pin(stream));
+        }
+
+        for (_name, index) in self.auxiliary {
+            if index.schema().supports(&range) {
+                let pivot = index.schema().columns().len() - self.schema.key().len();
+                let range = index.schema().extract_range(range).expect("range");
+
+                let primary = self.primary;
+                let index = index.read().await;
+                let stream = index
+                    .into_stream(range, reverse)
+                    .map_ok(move |row| row[pivot..].to_vec())
+                    .map_ok(move |key| {
+                        let range = b_tree::Range::from_prefix(key);
+                        let primary = primary.clone();
+
+                        async move {
+                            let index = primary.read().await;
+                            Ok(index.into_stream(range, reverse))
+                        }
+                    })
+                    .try_buffered(num_cpus::get())
+                    .try_flatten();
+
+                return Ok(Box::pin(stream));
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "this table has no index which supports the requested range: {:?}",
+                range
+            ),
+        ))
+    }
+}
+
 /// A database table with support for multiple indices
 pub struct Table<S, IS, C, G> {
     schema: Arc<S>,
@@ -447,11 +527,10 @@ where
             }
         }
 
-        // todo: count rows returned by Table::to_stream if possible
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "this table has no index to support the given range: {:?}",
+                "this table has no index to support the requested range: {:?}",
                 range
             ),
         ))
@@ -490,29 +569,13 @@ where
             }
         }
 
-        // todo: count rows returned by Table::to_stream if possible
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
-                "this table has no index to support the given range: {:?}",
+                "this table has no index to support the requested range: {:?}",
                 range
             ),
         ))
-    }
-
-    /// Construct a [`Stream`] of the values of the `columns` of the rows within the given `range`.
-    pub fn into_stream(
-        self,
-        range: Range<S::Id, S::Value>,
-        reverse: bool,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<S::Value>, io::Error>>>>, io::Error> {
-        if self.primary.schema().supports(&range) {
-            let range = self.primary.schema().extract_range(range).expect("range");
-            let stream = self.primary.into_stream(range, reverse);
-            return Ok(Box::pin(stream));
-        }
-
-        todo!()
     }
 }
 

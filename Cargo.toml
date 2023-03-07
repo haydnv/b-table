@@ -14,6 +14,7 @@ b-tree = { path = "../b-tree" }
 collate = { path = "../collate" }
 freqfs = { path = "../freqfs" }
 futures = "0.3"
+num_cpus = "1.15"
 safecast = { path = "../safecast" }
 
 [dev-dependencies]
