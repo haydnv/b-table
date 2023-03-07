@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::{Bound, Deref};
 use std::sync::Arc;
-use std::{fmt, io};
+use std::{fmt, io, iter};
 
 use b_tree::{BTree, BTreeLock, Key};
 use collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
@@ -25,10 +25,73 @@ pub type TableWriteGuard<S, IS, C, FE> = Table<S, IS, C, DirWriteGuardOwned<FE>>
 
 /// The schema of a [`Table`] index
 pub trait IndexSchema: b_tree::Schema + Clone {
+    type Id: Hash + Eq;
+
+    /// Borrow the list of columns specified by this schema.
+    fn columns(&self) -> &[Self::Id];
+
     /// Given a key matching this [`Schema`], extract a key matching the `other` [`Schema`].
     /// This values in `key` must be in order, but the values in `other` may be in any order.
     /// Panics: if `other` is not a subset of `self`.
     fn extract_key(&self, key: &[Self::Value], other: &Self) -> Key<Self::Value>;
+
+    /// Extract a [`b_tree::Range`] from the given [`Range`] if it matches this [`Schema`].
+    fn extract_range(
+        &self,
+        range: Range<Self::Id, Self::Value>,
+    ) -> Option<b_tree::Range<Self::Value>> {
+        if range.is_default() {
+            return Some(b_tree::Range::default());
+        }
+
+        let columns = self.columns();
+        let mut range = range.into_inner();
+
+        let mut prefix = Vec::with_capacity(columns.len());
+        let mut i = 0;
+
+        let index_range = loop {
+            if let Some(column) = columns.get(i) {
+                match range.remove(&column) {
+                    None => break b_tree::Range::from_prefix(prefix),
+                    Some(ColumnRange::Eq(value)) => {
+                        prefix.push(value);
+                        i += 1;
+                    }
+                    Some(ColumnRange::In((start, end))) => {
+                        break b_tree::Range::with_bounds(prefix, (start, end));
+                    }
+                }
+            } else {
+                break b_tree::Range::from_prefix(prefix);
+            }
+        };
+
+        if range.is_empty() {
+            Some(index_range)
+        } else {
+            None
+        }
+    }
+
+    /// Return `true` if a [`BTree`] with this [`Schema`] supports the given [`Range`].
+    fn supports(&self, range: &Range<Self::Id, Self::Value>) -> bool {
+        let columns = self.columns();
+        let mut i = 0;
+
+        while i < columns.len() {
+            match range.get(&columns[i]) {
+                None => break,
+                Some(ColumnRange::Eq(_)) => i += 1,
+                Some(ColumnRange::In(_)) => {
+                    i += 1;
+                    break;
+                }
+            }
+        }
+
+        i == range.len()
+    }
 }
 
 /// The schema of a [`Table`]
@@ -36,15 +99,14 @@ pub trait Schema {
     type Id: Hash + Eq;
     type Error: std::error::Error + From<io::Error>;
     type Value: Clone + Eq + fmt::Debug + 'static;
-    type Index: IndexSchema<Error = Self::Error, Value = Self::Value>;
+    type Index: IndexSchema<Error = Self::Error, Id = Self::Id, Value = Self::Value>;
 
     /// Borrow the schema of the primary index.
     fn primary(&self) -> &Self::Index;
 
     /// Borrow the schemata of the auxiliary indices.
-    /// This is a [`BTreeMap`] rather than a [`HashMap`]
-    /// because this [`Schema`] type should have a consistent hash.
-    fn auxiliary(&self) -> &BTreeMap<String, Self::Index>;
+    /// This is ordered so that the first index which matches a given [`Range`] will be used.
+    fn auxiliary(&self) -> &[(String, Self::Index)];
 
     /// Check that the given `key` is a valid primary key for a [`Table`] with this [`Schema`].
     fn validate_key(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error>;
@@ -54,6 +116,7 @@ pub trait Schema {
 }
 
 /// A range on a single column
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub enum ColumnRange<V> {
     Eq(V),
     In((Bound<V>, Bound<V>)),
@@ -89,7 +152,41 @@ where
     }
 }
 
+impl<V> From<V> for ColumnRange<V> {
+    fn from(value: V) -> Self {
+        Self::Eq(value)
+    }
+}
+
+impl<V> From<(Bound<V>, Bound<V>)> for ColumnRange<V> {
+    fn from(bounds: (Bound<V>, Bound<V>)) -> Self {
+        Self::In(bounds)
+    }
+}
+
+impl<V: fmt::Debug> fmt::Debug for ColumnRange<V> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Eq(value) => write!(f, "{:?}", value),
+            Self::In((start, end)) => {
+                match start {
+                    Bound::Unbounded => f.write_str("[."),
+                    Bound::Included(start) => write!(f, "[{start:?}."),
+                    Bound::Excluded(start) => write!(f, "({start:?}."),
+                }?;
+
+                match end {
+                    Bound::Unbounded => f.write_str(".]"),
+                    Bound::Included(end) => write!(f, ".{end:?}]"),
+                    Bound::Excluded(end) => write!(f, ".{end:?})"),
+                }
+            }
+        }
+    }
+}
+
 /// A range used in a where condition
+#[derive(Clone)]
 pub struct Range<K, V> {
     columns: HashMap<K, ColumnRange<V>>,
 }
@@ -103,6 +200,11 @@ impl<K, V> Default for Range<K, V> {
 }
 
 impl<K, V> Range<K, V> {
+    /// Destructure this [`Range`] into a [`HashMap`] of [`ColumnRanges`].
+    pub fn into_inner(self) -> HashMap<K, ColumnRange<V>> {
+        self.columns
+    }
+
     /// Return `true` if this [`Range`] has no bounds.
     pub fn is_default(&self) -> bool {
         self.columns.is_empty()
@@ -154,6 +256,50 @@ where
 
         // handle the case that both ranges are empty
         overlap.unwrap_or(Overlap::Equal)
+    }
+}
+
+impl<K: Hash + Eq, V> FromIterator<(K, V)> for Range<K, V> {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        Self {
+            columns: iter
+                .into_iter()
+                .map(|(name, bound)| (name, ColumnRange::Eq(bound)))
+                .collect(),
+        }
+    }
+}
+
+impl<K: Hash + Eq, V> FromIterator<(K, (Bound<V>, Bound<V>))> for Range<K, V> {
+    fn from_iter<I: IntoIterator<Item = (K, (Bound<V>, Bound<V>))>>(iter: I) -> Self {
+        Self {
+            columns: iter
+                .into_iter()
+                .map(|(name, bounds)| (name, ColumnRange::In(bounds)))
+                .collect(),
+        }
+    }
+}
+
+impl<K, V> fmt::Debug for Range<K, V>
+where
+    K: fmt::Display,
+    ColumnRange<V>: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("{")?;
+
+        write!(
+            f,
+            "{}",
+            self.columns
+                .iter()
+                .map(|(column, bound)| format!("{column}: {bound:?}"))
+                .collect::<Vec<String>>()
+                .join(", ")
+        )?;
+
+        f.write_str("}")
     }
 }
 
@@ -259,14 +405,25 @@ where
     C: Collate<Value = S::Value> + 'static,
     FE: FileLoad + AsType<Node<Vec<Vec<S::Value>>>>,
     G: Deref<Target = Dir<FE>> + 'static,
+    Range<S::Id, S::Value>: fmt::Debug,
 {
     /// Count how many rows in this [`Table`] lie within the given `range`.
-    pub async fn count(&self, range: &Range<S::Id, S::Value>) -> Result<u64, io::Error> {
-        if range.is_default() {
-            self.primary.count(&b_tree::Range::default()).await
-        } else {
-            todo!("Table::count")
+    pub async fn count(&self, range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
+        for index in iter::once(&self.primary).chain(self.auxiliary.iter()) {
+            if index.schema().supports(&range) {
+                let range = index.schema().extract_range(range).expect("range");
+                return index.count(&range).await;
+            }
         }
+
+        // todo: count rows returned by Table::to_stream if possible
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "this table has no index to support the given range: {:?}",
+                range
+            ),
+        ))
     }
 
     /// Return `true` if the given `key` is present in this [`Table`].
@@ -294,12 +451,22 @@ where
     }
 
     /// Return `true` if the given [`Range`] of this [`Table`] does not contain any rows.
-    pub async fn is_empty(&self, range: &Range<S::Id, S::Value>) -> Result<bool, io::Error> {
-        if range.is_default() {
-            self.primary.is_empty(&b_tree::Range::default()).await
-        } else {
-            todo!("Table::is_empty")
+    pub async fn is_empty(&self, range: Range<S::Id, S::Value>) -> Result<bool, io::Error> {
+        for index in iter::once(&self.primary).chain(self.auxiliary.iter()) {
+            if index.schema().supports(&range) {
+                let range = index.schema().extract_range(range).expect("range");
+                return index.is_empty(&range).await;
+            }
         }
+
+        // todo: count rows returned by Table::to_stream if possible
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "this table has no index to support the given range: {:?}",
+                range
+            ),
+        ))
     }
 
     /// Construct a [`Stream`] of the values of the `columns` of the rows within the given `range`.
@@ -320,6 +487,7 @@ where
     C: Collate<Value = S::Value> + 'static,
     FE: FileLoad + AsType<Node<Vec<Vec<S::Value>>>>,
     Node<S::Value>: fmt::Debug,
+    Range<S::Id, S::Value>: fmt::Debug,
 {
     /// Delete a row from this [`Table`] by its `key`.
     /// Returns `true` if the given `key` was present.

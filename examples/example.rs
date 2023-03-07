@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -140,6 +139,12 @@ impl b_tree::Schema for IndexSchema {
 }
 
 impl b_table::IndexSchema for IndexSchema {
+    type Id = String;
+
+    fn columns(&self) -> &[Self::Id] {
+        &self.columns
+    }
+
     fn extract_key(&self, key: &[Self::Value], other: &Self) -> Key<Self::Value> {
         use b_tree::Schema;
 
@@ -163,7 +168,7 @@ impl b_table::IndexSchema for IndexSchema {
 
 struct Schema {
     primary: IndexSchema,
-    auxiliary: BTreeMap<String, IndexSchema>,
+    auxiliary: Vec<(String, IndexSchema)>,
 }
 
 impl Schema {
@@ -183,7 +188,7 @@ impl Schema {
 }
 
 impl b_table::Schema for Schema {
-    type Id = &'static str;
+    type Id = String;
     type Error = io::Error;
     type Value = Value;
     type Index = IndexSchema;
@@ -192,7 +197,7 @@ impl b_table::Schema for Schema {
         &self.primary
     }
 
-    fn auxiliary(&self) -> &BTreeMap<String, IndexSchema> {
+    fn auxiliary(&self) -> &[(String, IndexSchema)] {
         &self.auxiliary
     }
 
@@ -254,12 +259,16 @@ async fn main() -> Result<(), io::Error> {
     // create the table
     let table = TableLock::create(schema, Collator::new(), dir)?;
 
-    let default_range = Range::default();
-
     {
         let guard = table.read().await;
-        assert_eq!(guard.count(&default_range).await?, 0);
-        assert!(guard.is_empty(&default_range).await?);
+
+        let range = Range::default();
+        assert_eq!(guard.count(range.clone()).await?, 0);
+        assert!(guard.is_empty(range).await?);
+
+        let range = Range::from_iter([("up".to_string(), Value::Number(1.into()))]);
+        assert_eq!(guard.count(range.clone()).await?, 0);
+        assert!(guard.is_empty(range).await?);
     }
 
     {
@@ -291,16 +300,34 @@ async fn main() -> Result<(), io::Error> {
                 .await?
         );
 
-        assert_eq!(guard.count(&default_range).await?, 1);
-        assert!(!guard.is_empty(&default_range).await?);
+        assert_eq!(guard.count(Default::default()).await?, 1);
+        assert!(!guard.is_empty(Default::default()).await?);
+
+        let range = Range::from_iter([("up".to_string(), Value::Number(1.into()))]);
+        assert_eq!(guard.count(range.clone()).await?, 1);
+        assert!(!guard.is_empty(range).await?);
+
+        let range =
+            Range::from_iter([("up_name".to_string(), Value::String("one".to_string()))]);
+        assert_eq!(guard.count(range.clone()).await?, 1);
+        assert!(!guard.is_empty(range).await?);
+
+        let range = Range::from_iter([("up".to_string(), Value::Number(2.into()))]);
+        assert_eq!(guard.count(range.clone()).await?, 0);
+        assert!(guard.is_empty(range).await?);
 
         guard.delete(vec![1.into()]).await?;
     }
 
     {
         let guard = table.read().await;
-        assert_eq!(guard.count(&default_range).await?, 0);
-        assert!(guard.is_empty(&default_range).await?);
+
+        assert_eq!(guard.count(Default::default()).await?, 0);
+        assert!(guard.is_empty(Default::default()).await?);
+
+        let range = Range::from_iter([("up".to_string(), Value::Number(1.into()))]);
+        assert_eq!(guard.count(range.clone()).await?, 0);
+        assert!(guard.is_empty(range).await?);
     }
 
     fs::remove_dir_all(path).await
