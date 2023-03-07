@@ -274,31 +274,15 @@ async fn main() -> Result<(), io::Error> {
     {
         let mut guard = table.write().await;
 
-        assert!(
-            guard
-                .upsert(
-                    vec![1.into()],
-                    vec![
-                        "one".to_string().into(),
-                        9.into(),
-                        "nine".to_string().into()
-                    ]
-                )
-                .await?
-        );
+        let key = vec![1.into()];
+        let values = vec![
+            "one".to_string().into(),
+            9.into(),
+            "nine".to_string().into(),
+        ];
 
-        assert!(
-            !guard
-                .upsert(
-                    vec![1.into()],
-                    vec![
-                        "one".to_string().into(),
-                        9.into(),
-                        "nine".to_string().into()
-                    ]
-                )
-                .await?
-        );
+        assert!(guard.upsert(key.to_vec(), values.to_vec()).await?);
+        assert!(!guard.upsert(key, values).await?);
 
         assert_eq!(guard.count(Default::default()).await?, 1);
         assert!(!guard.is_empty(Default::default()).await?);
@@ -314,11 +298,25 @@ async fn main() -> Result<(), io::Error> {
         let range = Range::from_iter([("up".to_string(), Value::Number(2.into()))]);
         assert_eq!(guard.count(range.clone()).await?, 0);
         assert!(guard.is_empty(range).await?);
-
-        guard.delete(vec![1.into()]).await?;
     }
 
     {
+        let mut stream = table.read().await.into_stream(Range::default(), false)?;
+
+        let row = vec![
+            1.into(),
+            "one".to_string().into(),
+            9.into(),
+            "nine".to_string().into(),
+        ];
+
+        assert_eq!(stream.try_next().await?, Some(row));
+        assert_eq!(stream.try_next().await?, None);
+    }
+
+    {
+        table.write().await.delete(vec![1.into()]).await?;
+
         let guard = table.read().await;
 
         assert_eq!(guard.count(Default::default()).await?, 0);

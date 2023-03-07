@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::{Bound, Deref};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt, io, iter};
 
@@ -9,7 +10,7 @@ use b_tree::{BTree, BTreeLock, Key};
 use collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 use freqfs::{Dir, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
 use futures::future::{join_all, try_join_all, TryFutureExt};
-use futures::stream::{self, Stream, TryStreamExt};
+use futures::stream::{Stream, TryStreamExt};
 use safecast::AsType;
 
 const PRIMARY: &str = "primary";
@@ -99,7 +100,7 @@ pub trait Schema {
     type Id: Hash + Eq;
     type Error: std::error::Error + From<io::Error>;
     type Value: Clone + Eq + fmt::Debug + 'static;
-    type Index: IndexSchema<Error = Self::Error, Id = Self::Id, Value = Self::Value>;
+    type Index: IndexSchema<Error = Self::Error, Id = Self::Id, Value = Self::Value> + 'static;
 
     /// Borrow the schema of the primary index.
     fn primary(&self) -> &Self::Index;
@@ -502,12 +503,16 @@ where
     /// Construct a [`Stream`] of the values of the `columns` of the rows within the given `range`.
     pub fn into_stream(
         self,
-        _range: Range<S::Id, S::Value>,
-        _columns: Vec<S::Id>,
-        _reverse: bool,
-    ) -> impl Stream<Item = Result<Vec<S::Value>, io::Error>> {
-        // TODO
-        stream::empty()
+        range: Range<S::Id, S::Value>,
+        reverse: bool,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<S::Value>, io::Error>>>>, io::Error> {
+        if self.primary.schema().supports(&range) {
+            let range = self.primary.schema().extract_range(range).expect("range");
+            let stream = self.primary.into_stream(range, reverse);
+            return Ok(Box::pin(stream));
+        }
+
+        todo!()
     }
 }
 
