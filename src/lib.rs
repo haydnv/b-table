@@ -15,8 +15,8 @@ use safecast::AsType;
 
 const PRIMARY: &str = "primary";
 
-/// A node in a [`BTree`]
-pub use b_tree::Node;
+/// A node in a [`BTree`] index
+pub type Node<V> = b_tree::Node<Vec<Key<V>>>;
 
 /// A read guard acquired on a [`TableLock`]
 pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, DirReadGuardOwned<FE>>;
@@ -340,7 +340,8 @@ impl<S, C, FE> TableLock<S, S::Index, C, FE>
 where
     S: Schema,
     C: Clone,
-    FE: FileLoad + AsType<Node<Vec<Key<S::Value>>>>,
+    FE: AsType<Node<S::Value>> + Send + Sync,
+    Node<S::Value>: FileLoad,
 {
     /// Create a new [`Table`]
     pub fn create(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
@@ -425,7 +426,10 @@ where
     }
 }
 
-impl<S: Schema, C, FE: FileLoad> TableLock<S, S::Index, C, FE> {
+impl<S: Schema, C, FE: Send + Sync> TableLock<S, S::Index, C, FE>
+where
+    Node<S::Value>: FileLoad,
+{
     /// Lock this [`Table`] for reading
     pub async fn read(&self) -> TableReadGuard<S, S::Index, C, FE> {
         // lock the primary key first, separately from the indices, to avoid a deadlock
@@ -451,7 +455,8 @@ impl<S, C, FE> TableLock<S, S::Index, C, FE>
 where
     S: Schema,
     C: Collate<Value = S::Value> + 'static,
-    FE: FileLoad + AsType<Node<Vec<Key<S::Value>>>>,
+    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    Node<S::Value>: FileLoad,
     Range<S::Id, S::Value>: fmt::Debug,
 {
     /// Construct a [`Stream`] of the values of the `columns` of the rows within the given `range`.
@@ -514,8 +519,9 @@ impl<S, C, FE, G> Table<S, S::Index, C, G>
 where
     S: Schema,
     C: Collate<Value = S::Value> + 'static,
-    FE: FileLoad + AsType<Node<Vec<Vec<S::Value>>>>,
+    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
     G: Deref<Target = Dir<FE>> + 'static,
+    Node<S::Value>: FileLoad,
     Range<S::Id, S::Value>: fmt::Debug,
 {
     /// Count how many rows in this [`Table`] lie within the given `range`.
@@ -583,8 +589,8 @@ impl<S, C, FE> Table<S, S::Index, C, DirWriteGuardOwned<FE>>
 where
     S: Schema,
     C: Collate<Value = S::Value> + 'static,
-    FE: FileLoad + AsType<Node<Vec<Vec<S::Value>>>>,
-    Node<S::Value>: fmt::Debug,
+    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    Node<S::Value>: FileLoad + fmt::Debug,
     Range<S::Id, S::Value>: fmt::Debug,
 {
     /// Delete a row from this [`Table`] by its `key`.

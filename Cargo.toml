@@ -18,11 +18,8 @@ num_cpus = "1.15"
 safecast = { path = "../safecast" }
 
 [dev-dependencies]
-async-trait = "0.1"
-bytes = "1.4"
 destream = { path = "../destream" }
-destream_json = { path = "../destream_json", features=["tokio-io", "value"] }
+destream_json = { path = "../destream_json", features = ["value"] }
 number-general = { path = "../number-general" }
 rand = "0.8"
 tokio = { version = "1.25", features = ["macros"] }
-tokio-util = { version = "0.7", features = ["io"] }

@@ -1,22 +1,19 @@
 use std::cmp::Ordering;
 use std::io;
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use async_trait::async_trait;
 use b_table::{Range, TableLock};
 use b_tree::{Key, Node};
-use bytes::Bytes;
 use collate::Collate;
-use destream::{de, en};
+use destream::en;
 use destream_json::Value;
-use freqfs::{Cache, FileLoad};
-use futures::{TryFutureExt, TryStreamExt};
+use freqfs::Cache;
+use futures::TryStreamExt;
 use number_general::NumberCollator;
 use rand::Rng;
 use safecast::as_type;
 use tokio::fs;
-use tokio_util::io::StreamReader;
 
 const BLOCK_SIZE: usize = 4_096;
 
@@ -51,15 +48,6 @@ enum File {
     Node(Node<Vec<Key<Value>>>),
 }
 
-#[async_trait]
-impl de::FromStream for File {
-    type Context = ();
-
-    async fn from_stream<D: de::Decoder>(cxt: (), decoder: &mut D) -> Result<Self, D::Error> {
-        Node::from_stream(cxt, decoder).map_ok(Self::Node).await
-    }
-}
-
 impl<'en> en::ToStream<'en> for File {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
@@ -69,34 +57,6 @@ impl<'en> en::ToStream<'en> for File {
 }
 
 as_type!(File, Node, Node<Vec<Key<Value>>>);
-
-#[async_trait]
-impl FileLoad for File {
-    async fn load(
-        _path: &Path,
-        file: fs::File,
-        _metadata: std::fs::Metadata,
-    ) -> Result<Self, io::Error> {
-        destream_json::de::read_from((), file)
-            .map_err(|cause| io::Error::new(io::ErrorKind::InvalidData, cause))
-            .await
-    }
-
-    async fn save(&self, file: &mut fs::File) -> Result<u64, io::Error> {
-        let encoded = destream_json::en::encode(self)
-            .map_err(|cause| io::Error::new(io::ErrorKind::InvalidData, cause))?;
-
-        let mut reader = StreamReader::new(
-            encoded
-                .map_ok(Bytes::from)
-                .map_err(|cause| io::Error::new(io::ErrorKind::InvalidData, cause)),
-        );
-
-        let size = tokio::io::copy(&mut reader, file).await?;
-        assert!(size > 0);
-        Ok(size)
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IndexSchema {
