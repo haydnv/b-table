@@ -9,6 +9,13 @@ readme = "README.md"
 keywords = ["persistent", "ordered", "indexed", "relational", "table"]
 categories = ["database", "database-implementations", "data-structures"]
 
+[features]
+stream = ["b-tree/stream"]
+
+[[example]]
+name = "example"
+required-features = ["stream"]
+
 [dependencies]
 b-tree = { path = "../b-tree" }
 collate = { path = "../collate" }
