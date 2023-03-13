@@ -454,7 +454,7 @@ where
 impl<S, C, FE> TableLock<S, S::Index, C, FE>
 where
     S: Schema,
-    C: Collate<Value = S::Value> + 'static,
+    C: Collate<Value = S::Value> + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static,
     Node<S::Value>: FileLoad,
     Range<S::Id, S::Value>: fmt::Debug,
