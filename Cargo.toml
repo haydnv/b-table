@@ -10,15 +10,16 @@ keywords = ["persistent", "ordered", "indexed", "relational", "table"]
 categories = ["database", "database-implementations", "data-structures"]
 
 [features]
-stream = ["b-tree/stream"]
+stream = ["async-trait", "b-tree/stream", "destream"]
 
 [[example]]
 name = "example"
 required-features = ["stream"]
 
 [dependencies]
+async-trait = { version = "0.1", optional = true }
 b-tree = { path = "../b-tree" }
-collate = { path = "../collate" }
+destream = { path = "../destream", optional = true }
 freqfs = { path = "../freqfs" }
 futures = "0.3"
 num_cpus = "1.15"
@@ -29,4 +30,4 @@ destream = { path = "../destream" }
 destream_json = { path = "../destream_json", features = ["value"] }
 number-general = { path = "../number-general" }
 rand = "0.8"
-tokio = { version = "1.25", features = ["macros"] }
+tokio = { version = "1.26", features = ["macros"] }

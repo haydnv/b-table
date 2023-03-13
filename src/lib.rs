@@ -6,12 +6,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt, io, iter};
 
+#[cfg(feature = "stream")]
+use async_trait::async_trait;
+use b_tree::collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 use b_tree::{BTree, BTreeLock, Key};
-use collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
+#[cfg(feature = "stream")]
+use destream::de;
 use freqfs::{Dir, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
 use futures::future::{join_all, try_join_all, TryFutureExt};
 use futures::stream::{Stream, TryStreamExt};
 use safecast::AsType;
+
+pub use b_tree;
+pub use b_tree::collate;
 
 const PRIMARY: &str = "primary";
 
@@ -460,7 +467,7 @@ where
     Range<S::Id, S::Value>: fmt::Debug,
 {
     /// Construct a [`Stream`] of the values of the `columns` of the rows within the given `range`.
-    pub async fn into_stream(
+    pub async fn rows(
         self,
         range: Range<S::Id, S::Value>,
         reverse: bool,
@@ -468,7 +475,7 @@ where
         if self.primary.schema().supports(&range) {
             let range = self.primary.schema().extract_range(range).expect("range");
             let index = self.primary.read().await;
-            let stream = index.into_stream(range, reverse);
+            let stream = index.keys(range, reverse);
             return Ok(Box::pin(stream));
         }
 
@@ -480,7 +487,7 @@ where
                 let primary = self.primary;
                 let index = index.read().await;
                 let stream = index
-                    .into_stream(range, reverse)
+                    .keys(range, reverse)
                     .map_ok(move |row| row[pivot..].to_vec())
                     .map_ok(move |key| {
                         let range = b_tree::Range::from_prefix(key);
@@ -488,7 +495,7 @@ where
 
                         async move {
                             let index = primary.read().await;
-                            Ok(index.into_stream(range, reverse))
+                            Ok(index.keys(range, reverse))
                         }
                     })
                     .try_buffered(num_cpus::get())
@@ -505,6 +512,77 @@ where
                 range
             ),
         ))
+    }
+}
+
+#[cfg(feature = "stream")]
+struct TableVisitor<S, IS, C, FE> {
+    table: TableLock<S, IS, C, FE>,
+}
+
+#[cfg(feature = "stream")]
+#[async_trait]
+impl<S, IS, C, FE> de::Visitor for TableVisitor<S, IS, C, FE>
+where
+    S: Schema<Index = IS> + Send + Sync + fmt::Debug,
+    IS: b_tree::Schema + Send + Sync,
+    C: Collate<Value = S::Value> + Send + Sync + 'static,
+    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    S::Value: de::FromStream<Context = ()>,
+    Node<S::Value>: FileLoad + fmt::Debug,
+    Range<S::Id, S::Value>: fmt::Debug,
+    IS::Error: Send + Sync,
+{
+    type Value = TableLock<S, IS, C, FE>;
+
+    fn expecting() -> &'static str {
+        "a Table"
+    }
+
+    async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut table = self.table.write().await;
+        let key_len = table.schema.key().len();
+
+        while let Some(mut row) = seq.next_element::<Vec<S::Value>>(()).await? {
+            if row.len() >= key_len {
+                let values = row.drain(key_len..).collect();
+                let key = row;
+                table.upsert(key, values).map_err(de::Error::custom).await?;
+            } else {
+                return Err(de::Error::invalid_length(
+                    row.len(),
+                    format!("a table row with schema {:?}", &table.schema),
+                ));
+            }
+        }
+
+        Ok(self.table)
+    }
+}
+
+#[cfg(feature = "stream")]
+#[async_trait]
+impl<S, IS, C, FE> de::FromStream for TableLock<S, IS, C, FE>
+where
+    S: Schema<Index = IS> + Send + Sync + fmt::Debug,
+    IS: b_tree::Schema + Send + Sync,
+    C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
+    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    S::Value: de::FromStream<Context = ()>,
+    Node<S::Value>: FileLoad + fmt::Debug,
+    Range<S::Id, S::Value>: fmt::Debug,
+    IS::Error: Send + Sync,
+{
+    type Context = (S, C, DirLock<FE>);
+
+    async fn from_stream<D: de::Decoder>(
+        context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        let (schema, collator, dir) = context;
+        let table = TableLock::create(schema, collator, dir).map_err(de::Error::custom)?;
+
+        decoder.decode_seq(TableVisitor { table }).await
     }
 }
 

@@ -3,9 +3,9 @@ use std::io;
 use std::ops::Bound;
 use std::path::PathBuf;
 
+use b_table::b_tree::{Key, Node};
+use b_table::collate::{self, Collate};
 use b_table::{Range, TableLock};
-use b_tree::{Key, Node};
-use collate::Collate;
 use destream::en;
 use destream_json::Value;
 use freqfs::Cache;
@@ -308,7 +308,7 @@ async fn main() -> Result<(), io::Error> {
     }
 
     {
-        let mut stream = table.clone().into_stream(Range::default(), false).await?;
+        let mut stream = table.clone().rows(Range::default(), false).await?;
 
         assert_eq!(stream.try_next().await?, Some(row1.clone()));
         assert_eq!(stream.try_next().await?, Some(row2.clone()));
@@ -319,7 +319,7 @@ async fn main() -> Result<(), io::Error> {
             (Bound::Unbounded, Bound::Excluded(10.into())),
         )]);
 
-        let mut stream = table.clone().into_stream(range, true).await?;
+        let mut stream = table.clone().rows(range, true).await?;
         assert_eq!(stream.try_next().await?, Some(row1.clone()));
         assert_eq!(stream.try_next().await?, Some(row2.clone()));
         assert_eq!(stream.try_next().await?, None);
