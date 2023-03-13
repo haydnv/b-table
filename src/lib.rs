@@ -587,9 +587,10 @@ where
 
 impl<S, C, FE> Table<S, S::Index, C, DirWriteGuardOwned<FE>>
 where
-    S: Schema,
-    C: Collate<Value = S::Value> + 'static,
+    S: Schema + Send + Sync,
+    C: Collate<Value = S::Value> + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    <S as Schema>::Index: Send + Sync,
     Node<S::Value>: FileLoad + fmt::Debug,
     Range<S::Id, S::Value>: fmt::Debug,
 {
