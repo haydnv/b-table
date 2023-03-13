@@ -663,6 +663,21 @@ where
     }
 }
 
+impl<S, IS, C, FE> Table<S, IS, C, DirWriteGuardOwned<FE>> {
+    /// Downgrade this write lock to a read lock.
+    pub fn downgrade(self) -> Table<S, IS, C, DirReadGuardOwned<FE>> {
+        Table {
+            schema: self.schema,
+            primary: self.primary.downgrade(),
+            auxiliary: self
+                .auxiliary
+                .into_iter()
+                .map(|index| index.downgrade())
+                .collect(),
+        }
+    }
+}
+
 impl<S, C, FE> Table<S, S::Index, C, DirWriteGuardOwned<FE>>
 where
     S: Schema + Send + Sync,
@@ -727,5 +742,19 @@ where
         }
 
         Ok(new)
+    }
+
+    /// Delete all rows from this [`Table`].
+    pub async fn truncate(&mut self) -> Result<(), io::Error> {
+        let mut truncates = Vec::with_capacity(self.auxiliary.len() + 1);
+        truncates.push(self.primary.truncate());
+
+        for index in &mut self.auxiliary {
+            truncates.push(index.truncate());
+        }
+
+        try_join_all(truncates).await?;
+
+        Ok(())
     }
 }
