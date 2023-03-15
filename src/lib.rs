@@ -336,9 +336,14 @@ impl<S, IS, C, FE> Clone for TableLock<S, IS, C, FE> {
 }
 
 impl<S, IS, C, FE> TableLock<S, IS, C, FE> {
-    /// Borrow the [`Schema`] of this [`Table`]
+    /// Borrow the [`Schema`] of this [`Table`].
     pub fn schema(&self) -> &S {
         &self.schema
+    }
+
+    /// Borrow the collator for this [`Table`].
+    pub fn collator(&self) -> &Arc<b_tree::Collator<C>> {
+        self.primary.collator()
     }
 }
 
@@ -398,23 +403,17 @@ where
             }
         }
 
-        let dir_contents = dir.try_read()?;
+        let mut dir_contents = dir.try_write()?;
 
         let primary = {
-            let dir = dir_contents
-                .get_dir(PRIMARY)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "primary table index"))?;
-
+            let dir = dir_contents.get_or_create_dir(PRIMARY.to_string())?;
             BTreeLock::load(schema.primary().clone(), collator.clone(), dir.clone())
         }?;
 
         let mut auxiliary = HashMap::with_capacity(schema.auxiliary().len());
         for (name, schema) in schema.auxiliary() {
             let index = {
-                let dir = dir_contents.get_dir(name).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, format!("table index {}", name))
-                })?;
-
+                let dir = dir_contents.get_or_create_dir(name.clone())?;
                 BTreeLock::load(schema.clone(), collator.clone(), dir.clone())
             }?;
 
