@@ -435,7 +435,7 @@ impl<S: Schema, C, FE: Send + Sync> TableLock<S, S::Index, C, FE>
 where
     Node<S::Value>: FileLoad,
 {
-    /// Lock this [`Table`] for reading
+    /// Lock this [`Table`] for reading.
     pub async fn read(&self) -> TableReadGuard<S, S::Index, C, FE> {
         // lock the primary key first, separately from the indices, to avoid a deadlock
         Table {
@@ -445,13 +445,33 @@ where
         }
     }
 
-    /// Lock this [`Table`] for writing
+    /// Lock this [`Table`] for reading, without borrowing.
+    pub async fn into_read(self) -> TableReadGuard<S, S::Index, C, FE> {
+        // lock the primary key first, separately from the indices, to avoid a deadlock
+        Table {
+            schema: self.schema,
+            primary: self.primary.into_read().await,
+            auxiliary: join_all(self.auxiliary.into_values().map(|index| index.into_read())).await,
+        }
+    }
+
+    /// Lock this [`Table`] for writing.
     pub async fn write(&self) -> TableWriteGuard<S, S::Index, C, FE> {
         // lock the primary key first, separately from the indices, to avoid a deadlock
         Table {
             schema: self.schema.clone(),
             primary: self.primary.write().await,
             auxiliary: join_all(self.auxiliary.values().map(|index| index.write())).await,
+        }
+    }
+
+    /// Lock this [`Table`] for writing, without borrowing.
+    pub async fn into_write(self) -> TableWriteGuard<S, S::Index, C, FE> {
+        // lock the primary key first, separately from the indices, to avoid a deadlock
+        Table {
+            schema: self.schema,
+            primary: self.primary.into_write().await,
+            auxiliary: join_all(self.auxiliary.into_values().map(|index| index.into_write())).await,
         }
     }
 }
@@ -461,6 +481,8 @@ where
     S: Schema,
     C: Collate<Value = S::Value> + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    S::Index: Send + Sync,
+    S::Value: Send,
     Node<S::Value>: FileLoad,
     Range<S::Id, S::Value>: fmt::Debug,
 {
@@ -469,7 +491,8 @@ where
         self,
         range: Range<S::Id, S::Value>,
         reverse: bool,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<S::Value>, io::Error>>>>, io::Error> {
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<S::Value>, io::Error>> + Send>>, io::Error>
+    {
         if self.primary.schema().supports(&range) {
             let range = self.primary.schema().extract_range(range).expect("range");
             let index = self.primary.read().await;
