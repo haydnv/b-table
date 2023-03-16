@@ -9,7 +9,7 @@ use std::{fmt, io, iter};
 use b_tree::collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 use b_tree::{BTree, BTreeLock, Key};
 use freqfs::{Dir, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
-use futures::future::{join_all, try_join_all, TryFutureExt};
+use futures::future::{join_all, try_join_all};
 use futures::stream::{Stream, TryStreamExt};
 use safecast::AsType;
 
@@ -577,15 +577,8 @@ where
     }
 
     /// Return `true` if the given `key` is present in this [`Table`].
-    pub async fn contains(&self, key: Key<S::Value>) -> Result<bool, S::Error> {
-        let key = self.schema.validate_key(key)?;
-        let range = b_tree::Range::from_prefix(key);
-
-        self.primary
-            .is_empty(&range)
-            .map_ok(|empty| !empty)
-            .map_err(S::Error::from)
-            .await
+    pub async fn contains(&self, key: &Key<S::Value>) -> Result<bool, io::Error> {
+        self.primary.contains(key).await
     }
 
     /// Look up a row by its `key`.
