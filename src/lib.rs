@@ -102,7 +102,7 @@ pub trait IndexSchema: b_tree::Schema + Clone {
 }
 
 /// The schema of a [`Table`]
-pub trait Schema {
+pub trait Schema: Eq + fmt::Debug {
     type Id: Hash + Eq;
     type Error: std::error::Error + From<io::Error>;
     type Value: Clone + Eq + fmt::Debug + 'static;
@@ -654,6 +654,72 @@ where
         }
 
         Ok(true)
+    }
+
+    /// Delete all rows from the `other` table from this one.
+    /// The `other` table **must** have an identical schema and collation.
+    pub async fn delete_all(
+        &mut self,
+        other: TableReadGuard<S, S::Index, C, FE>,
+    ) -> Result<(), S::Error> {
+        // no need to check the collator for equality, that will be done in the index operations
+
+        // but do check that the indices to merge are the same
+        if self.schema != other.schema {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot merge a table with schema {:?} into one with schema {:?}",
+                    other.schema, self.schema
+                ),
+            )
+            .into());
+        }
+
+        let mut deletes = Vec::with_capacity(self.auxiliary.len() + 1);
+
+        deletes.push(self.primary.delete_all(other.primary));
+
+        for (this, that) in self.auxiliary.iter_mut().zip(other.auxiliary) {
+            deletes.push(this.delete_all(that));
+        }
+
+        try_join_all(deletes).await?;
+
+        Ok(())
+    }
+
+    /// Insert all rows from the `other` table into this one.
+    /// The `other` table **must** have an identical schema and collation.
+    pub async fn merge(
+        &mut self,
+        other: TableReadGuard<S, S::Index, C, FE>,
+    ) -> Result<(), S::Error> {
+        // no need to check the collator for equality, that will be done in the merge operations
+
+        // but do check that the indices to merge are the same
+        if self.schema != other.schema {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot merge a table with schema {:?} into one with schema {:?}",
+                    other.schema, self.schema
+                ),
+            )
+            .into());
+        }
+
+        let mut merges = Vec::with_capacity(self.auxiliary.len() + 1);
+
+        merges.push(self.primary.merge(other.primary));
+
+        for (this, that) in self.auxiliary.iter_mut().zip(other.auxiliary) {
+            merges.push(this.merge(that));
+        }
+
+        try_join_all(merges).await?;
+
+        Ok(())
     }
 
     /// Insert or update a row in this [`Table`].
