@@ -589,15 +589,8 @@ where
     }
 
     /// Look up a row by its `key`.
-    pub async fn get(&self, key: Key<S::Value>) -> Result<Option<Vec<S::Value>>, S::Error> {
-        let key = self.schema.validate_key(key)?;
-        let range = b_tree::Range::from_prefix(key);
-        let mut keys = self.primary.to_stream(&range);
-        if let Some(block) = keys.try_next().await? {
-            Ok(block.first().cloned())
-        } else {
-            Ok(None)
-        }
+    pub async fn get(&self, key: &Key<S::Value>) -> Result<Option<Vec<S::Value>>, io::Error> {
+        self.primary.first(key).await
     }
 
     /// Return `true` if the given [`Range`] of this [`Table`] does not contain any rows.
@@ -645,8 +638,7 @@ where
 {
     /// Delete a row from this [`Table`] by its `key`.
     /// Returns `true` if the given `key` was present.
-    pub async fn delete(&mut self, key: Vec<S::Value>) -> Result<bool, S::Error> {
-        let key = self.schema.validate_key(key)?;
+    pub async fn delete(&mut self, key: &Key<S::Value>) -> Result<bool, S::Error> {
         let row = if let Some(row) = self.get(key).await? {
             row
         } else {
@@ -656,11 +648,13 @@ where
         let mut deletes = Vec::with_capacity(self.auxiliary.len() + 1);
 
         for index in &mut self.auxiliary {
-            let row = IndexSchema::extract_key(self.schema.primary(), &row, index.schema());
-            deletes.push(index.delete(row));
+            deletes.push(async {
+                let row = IndexSchema::extract_key(self.schema.primary(), &row, index.schema());
+                index.delete(&row).await
+            })
         }
 
-        deletes.push(self.primary.delete(row));
+        self.primary.delete(&row).await?;
 
         for present in try_join_all(deletes).await? {
             assert!(present, "table index is out of sync");
