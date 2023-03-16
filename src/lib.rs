@@ -272,6 +272,12 @@ where
     }
 }
 
+impl<K, V> From<HashMap<K, ColumnRange<V>>> for Range<K, V> {
+    fn from(columns: HashMap<K, ColumnRange<V>>) -> Self {
+        Self { columns }
+    }
+}
+
 impl<K: Hash + Eq, V> FromIterator<(K, V)> for Range<K, V> {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
         Self {
