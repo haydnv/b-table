@@ -308,15 +308,13 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("{")?;
 
-        write!(
-            f,
-            "{}",
-            self.columns
-                .iter()
-                .map(|(column, bound)| format!("{column}: {bound:?}"))
-                .collect::<Vec<String>>()
-                .join(", ")
-        )?;
+        for (i, (column, bound)) in self.columns.iter().enumerate() {
+            write!(f, "{column}: {bound:?}")?;
+
+            if i < self.len() - 1 {
+                f.write_str(", ")?;
+            }
+        }
 
         f.write_str("}")
     }
@@ -496,10 +494,13 @@ where
     pub async fn rows(
         self,
         range: Range<S::Id, S::Value>,
+        order: &[S::Id],
         reverse: bool,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<S::Value>, io::Error>> + Send>>, io::Error>
     {
-        if self.primary.schema().supports(&range) {
+        if self.primary.schema().supports(&range)
+            && self.primary.schema().columns().starts_with(order)
+        {
             let range = self.primary.schema().extract_range(range).expect("range");
             let index = self.primary.read().await;
             let stream = index.keys(range, reverse);
@@ -507,7 +508,7 @@ where
         }
 
         for (_name, index) in self.auxiliary {
-            if index.schema().supports(&range) {
+            if index.schema().supports(&range) && index.schema().columns().starts_with(order) {
                 let pivot = index.schema().columns().len() - self.schema.key().len();
                 let range = index.schema().extract_range(range).expect("range");
 

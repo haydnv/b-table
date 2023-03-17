@@ -127,6 +127,7 @@ impl b_table::IndexSchema for IndexSchema {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
 struct Schema {
     primary: IndexSchema,
     auxiliary: Vec<(String, IndexSchema)>,
@@ -308,7 +309,7 @@ async fn main() -> Result<(), io::Error> {
     }
 
     {
-        let mut stream = table.clone().rows(Range::default(), false).await?;
+        let mut stream = table.clone().rows(Range::default(), &[], false).await?;
 
         assert_eq!(stream.try_next().await?, Some(row1.clone()));
         assert_eq!(stream.try_next().await?, Some(row2.clone()));
@@ -319,7 +320,7 @@ async fn main() -> Result<(), io::Error> {
             (Bound::Unbounded, Bound::Excluded(10.into())),
         )]);
 
-        let mut stream = table.clone().rows(range, true).await?;
+        let mut stream = table.clone().rows(range, &[], true).await?;
         assert_eq!(stream.try_next().await?, Some(row1.clone()));
         assert_eq!(stream.try_next().await?, Some(row2.clone()));
         assert_eq!(stream.try_next().await?, None);
