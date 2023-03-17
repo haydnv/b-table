@@ -300,6 +300,14 @@ impl<K: Hash + Eq, V> FromIterator<(K, (Bound<V>, Bound<V>))> for Range<K, V> {
     }
 }
 
+impl<K: Hash + Eq, V> FromIterator<(K, ColumnRange<V>)> for Range<K, V> {
+    fn from_iter<I: IntoIterator<Item = (K, ColumnRange<V>)>>(iter: I) -> Self {
+        Self {
+            columns: iter.into_iter().collect(),
+        }
+    }
+}
+
 impl<K, V> fmt::Debug for Range<K, V>
 where
     K: fmt::Display,
