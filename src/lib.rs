@@ -103,7 +103,7 @@ pub trait IndexSchema: b_tree::Schema + Clone {
 
 /// The schema of a [`Table`]
 pub trait Schema: Eq + fmt::Debug {
-    type Id: Hash + Eq;
+    type Id: Hash + Eq + fmt::Display;
     type Error: std::error::Error + From<io::Error>;
     type Value: Clone + Eq + fmt::Debug + 'static;
     type Index: IndexSchema<Error = Self::Error, Id = Self::Id, Value = Self::Value> + 'static;
@@ -120,6 +120,29 @@ pub trait Schema: Eq + fmt::Debug {
     /// Borrow the schemata of the auxiliary indices.
     /// This is ordered so that the first index which matches a given [`Range`] will be used.
     fn auxiliary(&self) -> &[(String, Self::Index)];
+
+    fn extract_key(
+        &self,
+        index_key: Vec<Self::Value>,
+        index_schema: &Self::Index,
+    ) -> Vec<Self::Value> {
+        assert_eq!(index_key.len(), b_tree::Schema::len(index_schema));
+        assert!(self
+            .key()
+            .iter()
+            .all(|col_name| index_schema.columns().contains(col_name)));
+
+        let mut key = Vec::with_capacity(self.key().len());
+        for key_col_name in self.key() {
+            for (index_col_name, value) in index_schema.columns().iter().zip(&index_key) {
+                if key_col_name == index_col_name {
+                    key.push(value.clone());
+                }
+            }
+        }
+
+        key
+    }
 
     /// Check that the given `key` is a valid primary key for a [`Table`] with this [`Schema`].
     fn validate_key(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error>;
@@ -368,12 +391,14 @@ where
 {
     /// Create a new [`Table`]
     pub fn create(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
-        for (_name, index) in schema.auxiliary() {
-            if !index.columns().ends_with(schema.key()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "index columns must end with the primary key of the table",
-                ));
+        for (index_name, index) in schema.auxiliary() {
+            for col_name in schema.key() {
+                if !index.columns().contains(col_name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("index {index_name} is missing primary key column {col_name}"),
+                    ));
+                }
             }
         }
 
@@ -490,7 +515,7 @@ where
 
 impl<S, C, FE> TableLock<S, S::Index, C, FE>
 where
-    S: Schema,
+    S: Schema + Send + Sync + 'static,
     C: Collate<Value = S::Value> + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static,
     S::Index: Send + Sync,
@@ -506,26 +531,41 @@ where
         reverse: bool,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<S::Value>, io::Error>> + Send>>, io::Error>
     {
+        #[cfg(feature = "logging")]
+        log::debug!("Table::rows");
+
         if self.primary.schema().supports(&range)
             && self.primary.schema().columns().starts_with(order)
         {
+            #[cfg(feature = "logging")]
+            log::trace!("Table::rows will read only from the primary index");
+
             let range = self.primary.schema().extract_range(range).expect("range");
             let index = self.primary.read().await;
+
+            #[cfg(feature = "logging")]
+            log::trace!("Table::rows got a read lock on the primary index");
+
             let stream = index.keys(range, reverse);
             return Ok(Box::pin(stream));
         }
 
-        for (_name, index) in self.auxiliary {
+        #[allow(unused_variables)]
+        for (name, index) in self.auxiliary {
             if index.schema().supports(&range) && index.schema().columns().starts_with(order) {
-                let pivot = index.schema().columns().len() - self.schema.key().len();
+                #[cfg(feature = "logging")]
+                log::trace!("Table::rows will read only from index {}", name);
+
                 let range = index.schema().extract_range(range).expect("range");
 
+                let schema = self.schema;
                 let primary = self.primary;
+                let index_schema = index.schema().clone();
                 let index = index.read().await;
                 let stream = index
                     .keys(range, reverse)
-                    .map_ok(move |row| row[pivot..].to_vec())
-                    .map_ok(move |key| {
+                    .map_ok(move |index_key| {
+                        let key = schema.extract_key(index_key, &index_schema);
                         let range = b_tree::Range::from_prefix(key);
                         let primary = primary.clone();
 

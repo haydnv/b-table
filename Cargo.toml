@@ -10,6 +10,8 @@ keywords = ["persistent", "ordered", "indexed", "relational", "table"]
 categories = ["database", "database-implementations", "data-structures"]
 
 [features]
+all = ["logging", "stream"]
+logging = ["log", "b-tree/logging", "freqfs/logging"]
 stream = ["async-trait", "b-tree/stream", "destream"]
 
 [[example]]
@@ -22,6 +24,7 @@ b-tree = { path = "../b-tree" }
 destream = { path = "../destream", optional = true }
 freqfs = { path = "../freqfs" }
 futures = "0.3"
+log = { version = "0.4", features = ["release_max_level_info"], optional = true }
 num_cpus = "1.15"
 safecast = { path = "../safecast" }
 

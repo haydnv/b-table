@@ -3,9 +3,9 @@ use std::io;
 use std::ops::Bound;
 use std::path::PathBuf;
 
-use b_table::b_tree::{Key, Node};
+use b_table::b_tree::{Key, Node, Schema};
 use b_table::collate::{self, Collate};
-use b_table::{Range, TableLock};
+use b_table::{IndexSchema as IndexSchemaInstance, Range, TableLock};
 use destream::en;
 use destream_json::Value;
 use freqfs::Cache;
@@ -99,7 +99,7 @@ impl b_tree::Schema for IndexSchema {
     }
 }
 
-impl b_table::IndexSchema for IndexSchema {
+impl IndexSchemaInstance for IndexSchema {
     type Id = String;
 
     fn columns(&self) -> &[Self::Id] {
@@ -107,8 +107,6 @@ impl b_table::IndexSchema for IndexSchema {
     }
 
     fn extract_key(&self, key: &[Self::Value], other: &Self) -> Key<Self::Value> {
-        use b_tree::Schema;
-
         assert_eq!(key.len(), self.len());
 
         let mut other_key = Vec::with_capacity(other.len());
@@ -128,12 +126,12 @@ impl b_table::IndexSchema for IndexSchema {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct Schema {
+struct TableSchema {
     primary: IndexSchema,
     auxiliary: Vec<(String, IndexSchema)>,
 }
 
-impl Schema {
+impl TableSchema {
     fn new<C, I>(columns: C, indices: I) -> Self
     where
         C: IntoIterator<Item = &'static str>,
@@ -149,7 +147,7 @@ impl Schema {
     }
 }
 
-impl b_table::Schema for Schema {
+impl b_table::Schema for TableSchema {
     type Id = String;
     type Error = io::Error;
     type Value = Value;
@@ -218,7 +216,7 @@ async fn main() -> Result<(), io::Error> {
     let dir = cache.load(path.clone())?;
 
     // construct the schema
-    let schema = Schema::new(
+    let schema = TableSchema::new(
         vec!["up", "up_name", "down", "down_name"],
         [
             ("up_name".into(), vec!["up_name", "up"]),
