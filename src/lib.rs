@@ -680,7 +680,7 @@ where
 {
     /// Delete a row from this [`Table`] by its `key`.
     /// Returns `true` if the given `key` was present.
-    pub async fn delete(&mut self, key: &Key<S::Value>) -> Result<bool, S::Error> {
+    pub async fn delete_row(&mut self, key: &Key<S::Value>) -> Result<bool, S::Error> {
         let row = if let Some(row) = self.get(key).await? {
             row
         } else {
@@ -703,6 +703,60 @@ where
         }
 
         Ok(true)
+    }
+
+    /// Delete all rows in the given `range` from this [`Table`].
+    pub async fn delete_range(&mut self, range: Range<S::Id, S::Value>) -> Result<(), S::Error> {
+        let index = self.choose_index(&range)?;
+
+        let range = match index {
+            None => self.primary.schema().extract_range(range),
+            Some(i) => self.auxiliary[i].schema().extract_range(range),
+        }
+        .expect("index range");
+
+        while let Some(key) = self.next_row(index, &range).await? {
+            self.delete_row(&key).await?;
+        }
+
+        Ok(())
+    }
+
+    fn choose_index(&self, range: &Range<S::Id, S::Value>) -> Result<Option<usize>, io::Error> {
+        if self.primary.schema().supports(&range) {
+            Ok(None)
+        } else {
+            for (i, index) in self.auxiliary.iter().enumerate() {
+                if index.schema().supports(&range) {
+                    return Ok(Some(i));
+                }
+            }
+
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("no index supports the range {range:?}"),
+            ))
+        }
+    }
+
+    async fn next_row(
+        &self,
+        index: Option<usize>,
+        range: &b_tree::Range<S::Value>,
+    ) -> Result<Option<b_tree::Key<S::Value>>, io::Error> {
+        let index = match index {
+            None => &self.primary,
+            Some(i) => &self.auxiliary[i],
+        };
+
+        let mut nodes = index.nodes(range);
+        if let Some(node) = nodes.try_next().await? {
+            let row = node.iter().next().expect("row");
+            let key = self.primary.schema().extract_key(row, index.schema());
+            Ok(Some(key))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Delete all rows from the `other` table from this one.
