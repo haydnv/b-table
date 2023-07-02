@@ -631,8 +631,8 @@ where
     }
 
     /// Look up a row by its `key`.
-    pub async fn get(&self, key: &Key<S::Value>) -> Result<Option<Vec<S::Value>>, io::Error> {
-        self.primary.first(key).await
+    pub async fn get(&self, key: Key<S::Value>) -> Result<Option<Vec<S::Value>>, io::Error> {
+        self.primary.first(&b_tree::Range::from_prefix(key)).await
     }
 
     /// Return `true` if the given [`Range`] of this [`Table`] does not contain any rows.
@@ -680,7 +680,7 @@ where
 {
     /// Delete a row from this [`Table`] by its `key`.
     /// Returns `true` if the given `key` was present.
-    pub async fn delete_row(&mut self, key: &Key<S::Value>) -> Result<bool, S::Error> {
+    pub async fn delete_row(&mut self, key: Key<S::Value>) -> Result<bool, S::Error> {
         let row = if let Some(row) = self.get(key).await? {
             row
         } else {
@@ -716,7 +716,7 @@ where
         .expect("index range");
 
         while let Some(key) = self.next_row(index, &range).await? {
-            self.delete_row(&key).await?;
+            self.delete_row(key).await?;
         }
 
         Ok(())
@@ -749,10 +749,8 @@ where
             Some(i) => &self.auxiliary[i],
         };
 
-        let mut nodes = index.nodes(range);
-        if let Some(node) = nodes.try_next().await? {
-            let row = node.iter().next().expect("row");
-            let key = self.primary.schema().extract_key(row, index.schema());
+        if let Some(row) = index.first(range).await? {
+            let key = self.primary.schema().extract_key(&row, index.schema());
             Ok(Some(key))
         } else {
             Ok(None)

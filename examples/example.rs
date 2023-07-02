@@ -325,7 +325,7 @@ async fn main() -> Result<(), io::Error> {
     }
 
     {
-        table.write().await.delete_row(&vec![1.into()]).await?;
+        table.write().await.delete_row(vec![1.into()]).await?;
 
         let guard = table.read().await;
 
@@ -337,7 +337,7 @@ async fn main() -> Result<(), io::Error> {
     }
 
     {
-        table.write().await.delete_row(&vec![2.into()]).await?;
+        table.write().await.delete_row(vec![2.into()]).await?;
 
         let guard = table.read().await;
 
