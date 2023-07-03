@@ -4,19 +4,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt, io, iter};
 
-use b_tree::collate::Collate;
-use b_tree::{BTree, BTreeLock, Key};
 use freqfs::{Dir, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
 use futures::future::{join_all, try_join_all};
 use futures::stream::{Stream, TryStreamExt};
 use safecast::AsType;
 
+use super::index::collate::Collate;
+use super::index::{Index, IndexLock, Key};
 use super::schema::*;
+use super::Node;
 
 const PRIMARY: &str = "primary";
-
-/// A node in a [`BTree`] index
-pub type Node<V> = b_tree::Node<Vec<Key<V>>>;
 
 /// A read guard acquired on a [`TableLock`]
 pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, DirReadGuardOwned<FE>>;
@@ -28,8 +26,8 @@ pub type TableWriteGuard<S, IS, C, FE> = Table<S, IS, C, DirWriteGuardOwned<FE>>
 pub struct TableLock<S, IS, C, FE> {
     schema: Arc<S>,
     dir: DirLock<FE>,
-    primary: BTreeLock<IS, C, FE>,
-    auxiliary: HashMap<String, BTreeLock<IS, C, FE>>,
+    primary: IndexLock<IS, C, FE>,
+    auxiliary: HashMap<String, IndexLock<IS, C, FE>>,
 }
 
 impl<S, IS, C, FE> Clone for TableLock<S, IS, C, FE> {
@@ -50,7 +48,7 @@ impl<S, IS, C, FE> TableLock<S, IS, C, FE> {
     }
 
     /// Borrow the collator for this [`Table`].
-    pub fn collator(&self) -> &Arc<b_tree::Collator<C>> {
+    pub fn collator(&self) -> &Arc<super::index::Collator<C>> {
         self.primary.collator()
     }
 }
@@ -79,14 +77,14 @@ where
 
         let primary = {
             let dir = dir_contents.create_dir(PRIMARY.to_string())?;
-            BTreeLock::create(schema.primary().clone(), collator.clone(), dir)
+            IndexLock::create(schema.primary().clone(), collator.clone(), dir)
         }?;
 
         let mut auxiliary = HashMap::with_capacity(schema.auxiliary().len());
         for (name, schema) in schema.auxiliary() {
             let index = {
                 let dir = dir_contents.create_dir(name.to_string())?;
-                BTreeLock::create(schema.clone(), collator.clone(), dir)
+                IndexLock::create(schema.clone(), collator.clone(), dir)
             }?;
 
             auxiliary.insert(name.clone(), index);
@@ -117,14 +115,14 @@ where
 
         let primary = {
             let dir = dir_contents.get_or_create_dir(PRIMARY.to_string())?;
-            BTreeLock::load(schema.primary().clone(), collator.clone(), dir.clone())
+            IndexLock::load(schema.primary().clone(), collator.clone(), dir.clone())
         }?;
 
         let mut auxiliary = HashMap::with_capacity(schema.auxiliary().len());
         for (name, schema) in schema.auxiliary() {
             let index = {
                 let dir = dir_contents.get_or_create_dir(name.clone())?;
-                BTreeLock::load(schema.clone(), collator.clone(), dir.clone())
+                IndexLock::load(schema.clone(), collator.clone(), dir.clone())
             }?;
 
             auxiliary.insert(name.clone(), index);
@@ -204,6 +202,8 @@ where
         reverse: bool,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<S::Value>, io::Error>> + Send>>, io::Error>
     {
+        // TODO: formulate a query plan then follow it to stitch together multiple indices
+
         #[cfg(feature = "logging")]
         log::debug!("Table::rows");
 
@@ -267,8 +267,8 @@ where
 /// A database table with support for multiple indices
 pub struct Table<S, IS, C, G> {
     schema: Arc<S>,
-    primary: BTree<IS, C, G>,
-    auxiliary: Vec<BTree<IS, C, G>>,
+    primary: Index<IS, C, G>,
+    auxiliary: Vec<Index<IS, C, G>>,
 }
 
 impl<S, C, FE, G> Table<S, S::Index, C, G>
@@ -282,6 +282,8 @@ where
 {
     /// Count how many rows in this [`Table`] lie within the given `range`.
     pub async fn count(&self, range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
+        // TODO: formulate a query plan then follow it to stitch together multiple indices
+
         for index in iter::once(&self.primary).chain(self.auxiliary.iter()) {
             if index.schema().supports(&range) {
                 let range = index.schema().extract_range(range).expect("range");
@@ -380,6 +382,8 @@ where
 
     /// Delete all rows in the given `range` from this [`Table`].
     pub async fn delete_range(&mut self, range: Range<S::Id, S::Value>) -> Result<(), S::Error> {
+        // TODO: formulate a query plan then follow it to stitch together multiple indices
+
         let index = self.choose_index(&range)?;
 
         let range = match index {
@@ -395,6 +399,7 @@ where
         Ok(())
     }
 
+    // TODO: delete
     fn choose_index(&self, range: &Range<S::Id, S::Value>) -> Result<Option<usize>, io::Error> {
         if self.primary.schema().supports(&range) {
             Ok(None)
@@ -412,6 +417,7 @@ where
         }
     }
 
+    // TODO: delete
     async fn next_row(
         &self,
         index: Option<usize>,

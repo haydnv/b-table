@@ -3,9 +3,8 @@ use std::io;
 use std::ops::Bound;
 use std::path::PathBuf;
 
-use b_table::b_tree::{Key, Node, Schema};
 use b_table::collate::{self, Collate};
-use b_table::{IndexSchema as IndexSchemaInstance, Range, TableLock};
+use b_table::{BTreeSchema, IndexSchema as IndexSchemaInstance, Key, Node, Range, TableLock};
 use destream::en;
 use destream_json::Value;
 use freqfs::Cache;
@@ -45,7 +44,7 @@ impl Collate for Collator {
 }
 
 enum File {
-    Node(Node<Vec<Key<Value>>>),
+    Node(Node<Value>),
 }
 
 impl<'en> en::ToStream<'en> for File {
@@ -56,7 +55,7 @@ impl<'en> en::ToStream<'en> for File {
     }
 }
 
-as_type!(File, Node, Node<Vec<Key<Value>>>);
+as_type!(File, Node, Node<Value>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IndexSchema {
@@ -71,7 +70,7 @@ impl IndexSchema {
     }
 }
 
-impl b_tree::Schema for IndexSchema {
+impl BTreeSchema for IndexSchema {
     type Error = io::Error;
     type Value = Value;
 

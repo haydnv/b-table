@@ -5,22 +5,23 @@ use std::ops::Bound;
 use std::{fmt, io};
 
 use b_tree::collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
-use b_tree::Key;
 
-// const PRIMARY: &str = "primary";
+pub use b_tree::{Key, Schema as BTreeSchema};
 
-/// The schema of a [`Table`] index
-pub trait IndexSchema: b_tree::Schema + Clone {
+/// The schema of a table index
+pub trait IndexSchema: BTreeSchema + Clone {
     type Id: Hash + Eq;
 
     /// Borrow the list of columns specified by this schema.
     fn columns(&self) -> &[Self::Id];
 
+    // TODO: delete
     /// Given a key matching this [`Schema`], extract a key matching the `other` [`Schema`].
     /// This values in `key` must be in order, but the values in `other` may be in any order.
     /// Panics: if `other` is not a subset of `self`.
     fn extract_key(&self, key: &[Self::Value], other: &Self) -> Key<Self::Value>;
 
+    // TODO: delete
     /// Extract a [`b_tree::Range`] from the given [`Range`] if it matches this [`Schema`].
     fn extract_range(
         &self,
@@ -60,7 +61,8 @@ pub trait IndexSchema: b_tree::Schema + Clone {
         }
     }
 
-    /// Return `true` if a [`BTree`] with this [`Schema`] supports the given [`Range`].
+    // TODO: delete
+    /// Return `true` if an index with this schema supports the given [`Range`].
     fn supports(&self, range: &Range<Self::Id, Self::Value>) -> bool {
         let columns = self.columns();
         let mut i = 0;
@@ -80,6 +82,7 @@ pub trait IndexSchema: b_tree::Schema + Clone {
     }
 }
 
+// TODO: add a plan_query method
 /// The schema of a [`Table`]
 pub trait Schema: Eq + fmt::Debug {
     type Id: Hash + Eq + fmt::Display;
@@ -100,12 +103,13 @@ pub trait Schema: Eq + fmt::Debug {
     /// This is ordered so that the first index which matches a given [`Range`] will be used.
     fn auxiliary(&self) -> &[(String, Self::Index)];
 
+    // TODO: delete
     fn extract_key(
         &self,
         index_key: Vec<Self::Value>,
         index_schema: &Self::Index,
     ) -> Vec<Self::Value> {
-        assert_eq!(index_key.len(), b_tree::Schema::len(index_schema));
+        assert_eq!(index_key.len(), BTreeSchema::len(index_schema));
         assert!(self
             .key()
             .iter()
