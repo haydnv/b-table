@@ -6,6 +6,8 @@ edition = "2021"
 description = "A persistent database table based on b-tree"
 license = "Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/haydnv/b-table"
+
 keywords = ["persistent", "ordered", "indexed", "relational", "table"]
 categories = ["database", "database-implementations", "data-structures"]
 
@@ -20,17 +22,17 @@ required-features = ["stream"]
 
 [dependencies]
 async-trait = { version = "0.1", optional = true }
-b-tree = { path = "../b-tree" }
-destream = { path = "../destream", optional = true }
-freqfs = { path = "../freqfs" }
+b-tree = "0.1"
+destream = { version = "0.7", optional = true }
+freqfs = "0.8"
 futures = "0.3"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }
 num_cpus = "1.15"
-safecast = { path = "../safecast" }
+safecast = "0.2"
 
 [dev-dependencies]
-destream = { path = "../destream" }
-destream_json = { path = "../destream_json", features = ["value"] }
-number-general = { path = "../number-general" }
+destream = "0.7"
+destream_json = { version = "0.11", features = ["value"] }
+number-general = "0.10"
 rand = "0.8"
-tokio = { version = "1.26", features = ["macros"] }
+tokio = { version = "1.29", features = ["macros"] }
