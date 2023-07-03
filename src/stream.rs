@@ -9,12 +9,10 @@ use safecast::AsType;
 
 use super::{Node, Range, Schema, TableLock};
 
-#[cfg(feature = "stream")]
 struct TableVisitor<S, IS, C, FE> {
     table: TableLock<S, IS, C, FE>,
 }
 
-#[cfg(feature = "stream")]
 #[async_trait]
 impl<S, IS, C, FE> de::Visitor for TableVisitor<S, IS, C, FE>
 where
@@ -34,8 +32,9 @@ where
     }
 
     async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let key_len = self.table.schema().key().len();
+
         let mut table = self.table.write().await;
-        let key_len = table.schema.key().len();
 
         while let Some(mut row) = seq.next_element::<Vec<S::Value>>(()).await? {
             if row.len() >= key_len {
@@ -45,7 +44,7 @@ where
             } else {
                 return Err(de::Error::invalid_length(
                     row.len(),
-                    format!("a table row with schema {:?}", &table.schema),
+                    format!("a row of a table with schema {:?}", self.table.schema()),
                 ));
             }
         }
@@ -54,7 +53,6 @@ where
     }
 }
 
-#[cfg(feature = "stream")]
 #[async_trait]
 impl<S, IS, C, FE> de::FromStream for TableLock<S, IS, C, FE>
 where
