@@ -10,7 +10,7 @@ pub use b_tree::{Key, Schema as BTreeSchema};
 
 /// The schema of a table index
 pub trait IndexSchema: BTreeSchema + Clone {
-    type Id: Hash + Eq;
+    type Id: Hash + Eq + fmt::Debug;
 
     /// Borrow the list of columns specified by this schema.
     fn columns(&self) -> &[Self::Id];

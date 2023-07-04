@@ -127,7 +127,6 @@ where
     }
 }
 
-// TODO: implement a group_by method
 impl<S, C, FE, G> Index<S, C, G>
 where
     S: IndexSchema,
@@ -136,6 +135,31 @@ where
     G: Deref<Target = Dir<FE>> + Send + Sync + 'static,
     Node<S::Value>: FileLoad + fmt::Debug,
 {
+    pub fn group_by<R: Into<Arc<Range<S::Value>>>>(
+        self,
+        range: R,
+        columns: &[S::Id],
+        reverse: bool,
+    ) -> Result<
+        impl Stream<Item = Result<Key<S::Value>, io::Error>> + Unpin + Send + Sized,
+        io::Error,
+    > {
+        if self.schema().columns().starts_with(columns) {
+            Ok(super::group::GroupBy::new(
+                self.keys(range, reverse),
+                columns.len(),
+            ))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot group index with schema {schema:?} by columns {columns:?}",
+                    schema = self.schema()
+                ),
+            ))
+        }
+    }
+
     pub fn keys<R: Into<Arc<Range<S::Value>>>>(
         self,
         range: R,

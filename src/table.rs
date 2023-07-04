@@ -449,7 +449,7 @@ where
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "cannot merge a table with schema {:?} into one with schema {:?}",
+                    "cannot delete the contents of a table with schema {:?} from one with schema {:?}",
                     other.schema, self.schema
                 ),
             )
