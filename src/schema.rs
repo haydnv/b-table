@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::ops::Bound;
 use std::{fmt, io};
@@ -8,9 +8,133 @@ use b_tree::collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 
 pub use b_tree::{Key, Schema as BTreeSchema};
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum IndexId {
+    Primary,
+    Aux(usize),
+}
+
+#[derive(Eq, PartialEq)]
+pub struct QueryPlan<'a, S> {
+    schema: &'a S,
+    indices: Vec<IndexId>,
+}
+
+impl<'a, S> Clone for QueryPlan<'a, S> {
+    fn clone(&self) -> Self {
+        Self {
+            schema: self.schema,
+            indices: self.indices.clone(),
+        }
+    }
+}
+
+impl<'a, S: Schema> QueryPlan<'a, S> {
+    fn with_index(
+        schema: &'a S,
+        order: &[S::Id],
+        range: &Range<S::Id, S::Value>,
+        index_id: IndexId,
+    ) -> Option<Self> {
+        let index = get_index(schema, index_id);
+        if index.columns().is_empty() {
+            None
+        } else if order.is_empty() {
+            if range.is_default() {
+                Some(Self {
+                    schema,
+                    indices: vec![index_id],
+                })
+            } else if range.columns.contains_key(&index.columns()[0]) {
+                let mut indices = Vec::with_capacity((schema.auxiliary().len() + 1) * 2);
+                indices.push(index_id);
+                Some(Self { schema, indices })
+            } else {
+                None
+            }
+        } else if index.columns()[0] == order[0] {
+            let mut indices = Vec::with_capacity((schema.auxiliary().len() + 1) * 2);
+            indices.push(index_id);
+            Some(Self { schema, indices })
+        } else {
+            None
+        }
+    }
+
+    fn clone_and_push(&self, index_id: IndexId) -> Self {
+        let mut clone = self.clone();
+        clone.indices.push(index_id);
+        clone
+    }
+
+    fn covers(
+        &self,
+        order: &[S::Id],
+        range: &Range<S::Id, S::Value>,
+    ) -> (usize, HashSet<&'a S::Id>) {
+        let mut covered_order = 0;
+        let mut covered_range = HashSet::with_capacity(range.len());
+
+        for index_id in self.indices.iter().copied() {
+            let index = get_index(self.schema, index_id);
+            let mut index_covers = 0;
+
+            if covered_order < order.len() {
+                for col_name in index.columns() {
+                    if covered_order + index_covers < order.len() {
+                        if &order[covered_order + index_covers] == col_name {
+                            if range.columns.contains_key(col_name) {
+                                covered_range.insert(col_name);
+                            }
+
+                            index_covers += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            } else {
+                for col_name in index.columns() {
+                    if range.columns.contains_key(col_name) {
+                        covered_range.insert(col_name);
+                    }
+                }
+            }
+
+            covered_order += index_covers;
+        }
+
+        (covered_order, covered_range)
+    }
+
+    fn is_complete(&self, order: &[S::Id], range: &Range<S::Id, S::Value>) -> bool {
+        let (covered_order, covered_range) = self.covers(order, range);
+        debug_assert!(covered_order <= order.len());
+        debug_assert!(covered_range.len() <= range.len());
+        covered_order == order.len() && covered_range.len() == range.len()
+    }
+
+    fn needs(&self, order: &[S::Id], range: &Range<S::Id, S::Value>, index_id: IndexId) -> bool {
+        let (covered_order, covered_range) = self.covers(order, range);
+        debug_assert!(covered_order <= order.len());
+
+        let index_columns = get_index(self.schema, index_id).columns();
+        if index_columns.is_empty() {
+            false
+        } else if covered_order < order.len() {
+            index_columns.starts_with(&order[covered_order..covered_order + 1])
+        } else {
+            range.columns.contains_key(&index_columns[0])
+                && !covered_range.contains(&index_columns[0])
+        }
+    }
+}
+
 /// The schema of a table index
 pub trait IndexSchema: BTreeSchema + Clone {
-    type Id: Hash + Eq + fmt::Debug;
+    type Id: Hash + Eq + fmt::Debug + fmt::Display;
 
     /// Borrow the list of columns specified by this schema.
     fn columns(&self) -> &[Self::Id];
@@ -82,10 +206,9 @@ pub trait IndexSchema: BTreeSchema + Clone {
     }
 }
 
-// TODO: add a plan_query method
 /// The schema of a [`Table`]
-pub trait Schema: Eq + fmt::Debug {
-    type Id: Hash + Eq + fmt::Display;
+pub trait Schema: Eq + Sized + fmt::Debug {
+    type Id: Hash + Eq + fmt::Debug + fmt::Display;
     type Error: std::error::Error + From<io::Error>;
     type Value: Clone + Eq + fmt::Debug + 'static;
     type Index: IndexSchema<Error = Self::Error, Id = Self::Id, Value = Self::Value> + 'static;
@@ -125,6 +248,61 @@ pub trait Schema: Eq + fmt::Debug {
         }
 
         key
+    }
+
+    /// Compute a sequence of indices to read from in order construct a result set
+    /// with the given range and order.
+    fn plan_query<'a>(
+        &'a self,
+        order: &[Self::Id],
+        range: &Range<Self::Id, Self::Value>,
+    ) -> Result<QueryPlan<'a, Self>, io::Error> {
+        let mut candidates = VecDeque::with_capacity(self.auxiliary().len() * 2);
+
+        if let Some(candidate) = QueryPlan::with_index(self, order, range, IndexId::Primary) {
+            if candidate.is_complete(order, range) {
+                return Ok(candidate);
+            } else {
+                candidates.push_back(candidate);
+            }
+        }
+
+        for index_id in (0..self.auxiliary().len()).into_iter().map(IndexId::Aux) {
+            if let Some(candidate) = QueryPlan::with_index(self, order, range, index_id) {
+                if candidate.is_complete(order, range) {
+                    return Ok(candidate);
+                } else {
+                    candidates.push_back(candidate);
+                }
+            }
+        }
+
+        while let Some(plan) = candidates.pop_front() {
+            if plan.needs(order, range, IndexId::Primary) {
+                let candidate = plan.clone_and_push(IndexId::Primary);
+                if candidate.is_complete(order, range) {
+                    return Ok(candidate);
+                } else {
+                    candidates.push_back(candidate);
+                }
+            }
+
+            for index_id in (0..self.auxiliary().len()).into_iter().map(IndexId::Aux) {
+                if plan.needs(order, range, index_id) {
+                    let candidate = plan.clone_and_push(index_id);
+                    if candidate.is_complete(order, range) {
+                        return Ok(candidate);
+                    } else {
+                        candidates.push_back(candidate);
+                    }
+                }
+            }
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("no index supports range {range:?} with order {order:?}"),
+        ))
     }
 
     /// Check that the given `key` is a valid primary key for a [`Table`] with this [`Schema`].
@@ -331,5 +509,12 @@ where
         }
 
         f.write_str("}")
+    }
+}
+
+fn get_index<S: Schema>(schema: &S, index_id: IndexId) -> &S::Index {
+    match index_id {
+        IndexId::Primary => schema.primary(),
+        IndexId::Aux(i) => &schema.auxiliary()[i].1,
     }
 }
