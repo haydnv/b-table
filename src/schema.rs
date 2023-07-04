@@ -8,16 +8,10 @@ use b_tree::collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 
 pub use b_tree::{Key, Schema as BTreeSchema};
 
-#[derive(Copy, Clone, Eq, PartialEq)]
-pub enum IndexId {
-    Primary,
-    Aux(usize),
-}
-
 #[derive(Eq, PartialEq)]
 pub struct QueryPlan<'a, S> {
     schema: &'a S,
-    indices: Vec<IndexId>,
+    pub indices: VecDeque<&'a str>,
 }
 
 impl<'a, S> Clone for QueryPlan<'a, S> {
@@ -30,11 +24,18 @@ impl<'a, S> Clone for QueryPlan<'a, S> {
 }
 
 impl<'a, S: Schema> QueryPlan<'a, S> {
+    fn empty(schema: &'a S) -> Self {
+        Self {
+            schema,
+            indices: VecDeque::default(),
+        }
+    }
+
     fn with_index(
         schema: &'a S,
         order: &[S::Id],
         range: &Range<S::Id, S::Value>,
-        index_id: IndexId,
+        index_id: &'a str,
     ) -> Option<Self> {
         let index = get_index(schema, index_id);
         if index.columns().is_empty() {
@@ -43,27 +44,27 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
             if range.is_default() {
                 Some(Self {
                     schema,
-                    indices: vec![index_id],
+                    indices: [index_id].into_iter().collect(),
                 })
             } else if range.columns.contains_key(&index.columns()[0]) {
-                let mut indices = Vec::with_capacity((schema.auxiliary().len() + 1) * 2);
-                indices.push(index_id);
+                let mut indices = VecDeque::with_capacity((schema.auxiliary().len() + 1) * 2);
+                indices.push_back(index_id);
                 Some(Self { schema, indices })
             } else {
                 None
             }
         } else if index.columns()[0] == order[0] {
-            let mut indices = Vec::with_capacity((schema.auxiliary().len() + 1) * 2);
-            indices.push(index_id);
+            let mut indices = VecDeque::with_capacity((schema.auxiliary().len() + 1) * 2);
+            indices.push_back(index_id);
             Some(Self { schema, indices })
         } else {
             None
         }
     }
 
-    fn clone_and_push(&self, index_id: IndexId) -> Self {
+    fn clone_and_push(&self, index_id: &'a str) -> Self {
         let mut clone = self.clone();
-        clone.indices.push(index_id);
+        clone.indices.push_back(index_id);
         clone
     }
 
@@ -116,7 +117,7 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
         covered_order == order.len() && covered_range.len() == range.len()
     }
 
-    fn needs(&self, order: &[S::Id], range: &Range<S::Id, S::Value>, index_id: IndexId) -> bool {
+    fn needs(&self, order: &[S::Id], range: &Range<S::Id, S::Value>, index_id: &str) -> bool {
         let (covered_order, covered_range) = self.covers(order, range);
         debug_assert!(covered_order <= order.len());
 
@@ -130,6 +131,26 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
                 && !covered_range.contains(&index_columns[0])
         }
     }
+
+    fn supports(&self, index_id: &str) -> bool {
+        let available_columns = self
+            .indices
+            .iter()
+            .last()
+            .copied()
+            .map(|index_id| get_index(self.schema, index_id).columns())
+            .unwrap_or_default();
+
+        let index_columns = get_index(self.schema, index_id).columns();
+
+        if available_columns.is_empty() {
+            true
+        } else if index_columns.is_empty() {
+            false
+        } else {
+            available_columns.contains(&index_columns[0])
+        }
+    }
 }
 
 /// The schema of a table index
@@ -139,53 +160,33 @@ pub trait IndexSchema: BTreeSchema + Clone {
     /// Borrow the list of columns specified by this schema.
     fn columns(&self) -> &[Self::Id];
 
-    // TODO: delete
-    /// Given a key matching this [`Schema`], extract a key matching the `other` [`Schema`].
-    /// This values in `key` must be in order, but the values in `other` may be in any order.
-    /// Panics: if `other` is not a subset of `self`.
-    fn extract_key(&self, key: &[Self::Value], other: &Self) -> Key<Self::Value>;
+    /// Construct a [`Key`] for this index from the values of a [`Key`] from a different index.
+    ///
+    /// Panics:
+    ///     - if `other_key` does not match `other_schema`
+    ///     - if `other_schema` does not contain all the columns of this schema
+    fn extract_key(&self, other_key: &[Self::Value], other_schema: &Self) -> Key<Self::Value> {
+        assert_eq!(other_key.len(), BTreeSchema::len(other_schema));
 
-    // TODO: delete
-    /// Extract a [`b_tree::Range`] from the given [`Range`] if it matches this [`Schema`].
-    fn extract_range(
-        &self,
-        range: Range<Self::Id, Self::Value>,
-    ) -> Option<b_tree::Range<Self::Value>> {
-        if range.is_default() {
-            return Some(b_tree::Range::default());
-        }
-
-        let columns = self.columns();
-        let mut range = range.into_inner();
-
-        let mut prefix = Vec::with_capacity(columns.len());
-        let mut i = 0;
-
-        let index_range = loop {
-            if let Some(column) = columns.get(i) {
-                match range.remove(&column) {
-                    None => break b_tree::Range::from_prefix(prefix),
-                    Some(ColumnRange::Eq(value)) => {
-                        prefix.push(value);
-                        i += 1;
-                    }
-                    Some(ColumnRange::In((start, end))) => {
-                        break b_tree::Range::with_bounds(prefix, (start, end));
-                    }
+        let mut key = Key::with_capacity(BTreeSchema::len(self));
+        for this_col_name in self.columns() {
+            let mut found = false;
+            for (that_col_name, value) in other_schema.columns().iter().zip(other_key) {
+                if this_col_name == that_col_name {
+                    key.push(value.clone());
+                    found = true;
+                    break;
                 }
-            } else {
-                break b_tree::Range::from_prefix(prefix);
             }
-        };
 
-        if range.is_empty() {
-            Some(index_range)
-        } else {
-            None
+            if !found {
+                panic!("index {other_schema:?} is missing column {this_col_name}");
+            }
         }
+
+        key
     }
 
-    // TODO: delete
     /// Return `true` if an index with this schema supports the given [`Range`].
     fn supports(&self, range: &Range<Self::Id, Self::Value>) -> bool {
         let columns = self.columns();
@@ -210,8 +211,11 @@ pub trait IndexSchema: BTreeSchema + Clone {
 pub trait Schema: Eq + Sized + fmt::Debug {
     type Id: Hash + Eq + fmt::Debug + fmt::Display;
     type Error: std::error::Error + From<io::Error>;
-    type Value: Clone + Eq + fmt::Debug + 'static;
-    type Index: IndexSchema<Error = Self::Error, Id = Self::Id, Value = Self::Value> + 'static;
+    type Value: Clone + Eq + Send + Sync + fmt::Debug + 'static;
+    type Index: IndexSchema<Error = Self::Error, Id = Self::Id, Value = Self::Value>
+        + Send
+        + Sync
+        + 'static;
 
     /// Borrow the names of the columns in the primary key.
     fn key(&self) -> &[Self::Id];
@@ -226,30 +230,6 @@ pub trait Schema: Eq + Sized + fmt::Debug {
     /// This is ordered so that the first index which matches a given [`Range`] will be used.
     fn auxiliary(&self) -> &[(String, Self::Index)];
 
-    // TODO: delete
-    fn extract_key(
-        &self,
-        index_key: Vec<Self::Value>,
-        index_schema: &Self::Index,
-    ) -> Vec<Self::Value> {
-        assert_eq!(index_key.len(), BTreeSchema::len(index_schema));
-        assert!(self
-            .key()
-            .iter()
-            .all(|col_name| index_schema.columns().contains(col_name)));
-
-        let mut key = Vec::with_capacity(self.key().len());
-        for key_col_name in self.key() {
-            for (index_col_name, value) in index_schema.columns().iter().zip(&index_key) {
-                if key_col_name == index_col_name {
-                    key.push(value.clone());
-                }
-            }
-        }
-
-        key
-    }
-
     /// Compute a sequence of indices to read from in order construct a result set
     /// with the given range and order.
     fn plan_query<'a>(
@@ -257,18 +237,14 @@ pub trait Schema: Eq + Sized + fmt::Debug {
         order: &[Self::Id],
         range: &Range<Self::Id, Self::Value>,
     ) -> Result<QueryPlan<'a, Self>, io::Error> {
-        let mut candidates = VecDeque::with_capacity(self.auxiliary().len() * 2);
-
-        if let Some(candidate) = QueryPlan::with_index(self, order, range, IndexId::Primary) {
-            if candidate.is_complete(order, range) {
-                return Ok(candidate);
-            } else {
-                candidates.push_back(candidate);
-            }
+        if self.primary().columns().starts_with(order) && self.primary().supports(range) {
+            return Ok(QueryPlan::empty(self));
         }
 
-        for index_id in (0..self.auxiliary().len()).into_iter().map(IndexId::Aux) {
-            if let Some(candidate) = QueryPlan::with_index(self, order, range, index_id) {
+        let mut candidates = VecDeque::with_capacity(self.auxiliary().len() * 2);
+
+        for (name, _index) in self.auxiliary() {
+            if let Some(candidate) = QueryPlan::with_index(self, order, range, name) {
                 if candidate.is_complete(order, range) {
                     return Ok(candidate);
                 } else {
@@ -278,18 +254,9 @@ pub trait Schema: Eq + Sized + fmt::Debug {
         }
 
         while let Some(plan) = candidates.pop_front() {
-            if plan.needs(order, range, IndexId::Primary) {
-                let candidate = plan.clone_and_push(IndexId::Primary);
-                if candidate.is_complete(order, range) {
-                    return Ok(candidate);
-                } else {
-                    candidates.push_back(candidate);
-                }
-            }
-
-            for index_id in (0..self.auxiliary().len()).into_iter().map(IndexId::Aux) {
-                if plan.needs(order, range, index_id) {
-                    let candidate = plan.clone_and_push(index_id);
+            for (name, _index) in self.auxiliary() {
+                if plan.supports(name) && plan.needs(order, range, name) {
+                    let candidate = plan.clone_and_push(name);
                     if candidate.is_complete(order, range) {
                         return Ok(candidate);
                     } else {
@@ -512,9 +479,11 @@ where
     }
 }
 
-fn get_index<S: Schema>(schema: &S, index_id: IndexId) -> &S::Index {
-    match index_id {
-        IndexId::Primary => schema.primary(),
-        IndexId::Aux(i) => &schema.auxiliary()[i].1,
-    }
+fn get_index<'a, S: Schema>(schema: &'a S, index_id: &'a str) -> &'a S::Index {
+    schema
+        .auxiliary()
+        .iter()
+        .filter_map(|(name, index)| if name == index_id { Some(index) } else { None })
+        .next()
+        .expect("index")
 }
