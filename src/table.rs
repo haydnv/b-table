@@ -250,8 +250,25 @@ where
     }
 
     /// Look up a row by its `key`.
-    pub async fn get(&self, key: Key<S::Value>) -> Result<Option<Vec<S::Value>>, io::Error> {
-        self.primary.first(&b_tree::Range::from_prefix(key)).await
+    pub async fn get_row(&self, key: Key<S::Value>) -> Result<Option<Vec<S::Value>>, S::Error> {
+        let key = self.schema.validate_key(key)?;
+
+        self.primary
+            .first(&b_tree::Range::from_prefix(key))
+            .map_err(S::Error::from)
+            .await
+    }
+
+    /// Look up a value by its `key`.
+    pub async fn get_value(&self, key: Key<S::Value>) -> Result<Option<Vec<S::Value>>, S::Error> {
+        let key = self.schema.validate_key(key)?;
+        let key_len = self.schema.key().len();
+
+        self.primary
+            .first(&b_tree::Range::from_prefix(key))
+            .map_ok(|maybe_row| maybe_row.map(|row| row[key_len..].to_vec()))
+            .map_err(S::Error::from)
+            .await
     }
 }
 
@@ -418,7 +435,7 @@ where
     /// Delete a row from this [`Table`] by its `key`.
     /// Returns `true` if the given `key` was present.
     pub async fn delete_row(&mut self, key: Key<S::Value>) -> Result<bool, S::Error> {
-        let row = if let Some(row) = self.get(key).await? {
+        let row = if let Some(row) = self.get_row(key).await? {
             row
         } else {
             return Ok(false);
