@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
-use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt, io};
 
-use freqfs::{Dir, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
+use freqfs::{DirDeref, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
 use futures::future::{try_join_all, TryFutureExt};
 use futures::stream::{Stream, TryStreamExt};
 use safecast::AsType;
@@ -17,7 +16,7 @@ use super::Node;
 const PRIMARY: &str = "primary";
 
 /// A read guard acquired on a [`TableLock`]
-pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, DirReadGuardOwned<FE>>;
+pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, Arc<DirReadGuardOwned<FE>>>;
 
 /// A write guard acquired on a [`TableLock`]
 pub type TableWriteGuard<S, IS, C, FE> = Table<S, IS, C, DirWriteGuardOwned<FE>>;
@@ -232,7 +231,20 @@ where
 pub struct Table<S, IS, C, G> {
     schema: Arc<S>,
     primary: Index<IS, C, G>,
-    auxiliary: HashMap<String, Index<IS, C, G>>,
+    auxiliary: HashMap<String, Index<IS, C, G>>, // TODO: should this be in an Arc?
+}
+
+impl<S, IS, C, G> Clone for Table<S, IS, C, G>
+where
+    G: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            schema: self.schema.clone(),
+            primary: self.primary.clone(),
+            auxiliary: self.auxiliary.clone(),
+        }
+    }
 }
 
 impl<S, C, FE, G> Table<S, S::Index, C, G>
@@ -240,7 +252,7 @@ where
     S: Schema,
     C: Collate<Value = S::Value> + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static,
-    G: Deref<Target = Dir<FE>> + 'static,
+    G: DirDeref<Entry = FE> + 'static,
     Node<S::Value>: FileLoad,
     Range<S::Id, S::Value>: fmt::Debug,
 {
@@ -277,7 +289,7 @@ where
     S: Schema,
     C: Collate<Value = S::Value> + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static,
-    G: Deref<Target = Dir<FE>> + Send + Sync + 'static,
+    G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
     Node<S::Value>: FileLoad,
     Range<S::Id, S::Value>: fmt::Debug,
 {
@@ -410,7 +422,7 @@ fn extract_range<IS: IndexSchema>(
 
 impl<S, IS, C, FE> Table<S, IS, C, DirWriteGuardOwned<FE>> {
     /// Downgrade this write lock to a read lock.
-    pub fn downgrade(self) -> Table<S, IS, C, DirReadGuardOwned<FE>> {
+    pub fn downgrade(self) -> Table<S, IS, C, Arc<DirReadGuardOwned<FE>>> {
         Table {
             schema: self.schema,
             primary: self.primary.downgrade(),

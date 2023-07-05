@@ -1,10 +1,9 @@
-use std::ops::Deref;
 use std::sync::Arc;
 use std::{fmt, io};
 
 use b_tree::collate::Collate;
 use b_tree::{BTree, BTreeLock};
-use freqfs::{Dir, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
+use freqfs::{DirDeref, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
 use futures::{FutureExt, Stream};
 use safecast::AsType;
 
@@ -14,7 +13,7 @@ use super::Node;
 pub use b_tree::collate;
 pub use b_tree::{Collator, Key, Range};
 
-pub type IndexReadGuard<S, C, FE> = Index<S, C, DirReadGuardOwned<FE>>;
+pub type IndexReadGuard<S, C, FE> = Index<S, C, Arc<DirReadGuardOwned<FE>>>;
 
 pub type IndexWriteGuard<S, C, FE> = Index<S, C, DirWriteGuardOwned<FE>>;
 
@@ -92,6 +91,17 @@ pub struct Index<S, C, G> {
     btree: BTree<S, C, G>,
 }
 
+impl<S, C, G> Clone for Index<S, C, G>
+where
+    G: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            btree: self.btree.clone(),
+        }
+    }
+}
+
 impl<S, C, G> Index<S, C, G>
 where
     S: IndexSchema,
@@ -107,7 +117,7 @@ where
     S: IndexSchema,
     C: Collate<Value = S::Value>,
     FE: AsType<Node<S::Value>> + Send + Sync,
-    G: Deref<Target = Dir<FE>>,
+    G: DirDeref<Entry = FE>,
     Node<S::Value>: FileLoad + fmt::Debug,
 {
     pub async fn contains(&self, key: &Key<S::Value>) -> Result<bool, io::Error> {
@@ -132,7 +142,7 @@ where
     S: IndexSchema,
     C: Collate<Value = S::Value> + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static,
-    G: Deref<Target = Dir<FE>> + Send + Sync + 'static,
+    G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
     Node<S::Value>: FileLoad + fmt::Debug,
 {
     pub fn group_by<R: Into<Arc<Range<S::Value>>>>(
@@ -190,7 +200,7 @@ where
 
     pub async fn delete_all<G>(&mut self, other: Index<S, C, G>) -> Result<(), S::Error>
     where
-        G: Deref<Target = Dir<FE>> + Send + Sync + 'static,
+        G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
     {
         self.btree.delete_all(other.btree).await
     }
@@ -201,7 +211,7 @@ where
 
     pub async fn merge<G>(&mut self, other: Index<S, C, G>) -> Result<(), S::Error>
     where
-        G: Deref<Target = Dir<FE>> + Send + Sync + 'static,
+        G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
     {
         self.btree.merge(other.btree).await
     }
