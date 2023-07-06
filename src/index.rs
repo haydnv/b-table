@@ -33,10 +33,6 @@ impl<S, C, FE> IndexLock<S, C, FE> {
     pub fn collator(&self) -> &Arc<Collator<C>> {
         self.btree.collator()
     }
-
-    pub fn schema(&self) -> &S {
-        self.btree.schema()
-    }
 }
 
 impl<S, C, FE> IndexLock<S, C, FE>

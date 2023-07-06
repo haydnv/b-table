@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
+use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt, io};
 
 use freqfs::{DirDeref, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
 use futures::future::{try_join_all, TryFutureExt};
-use futures::stream::{Stream, TryStreamExt};
+use futures::stream::{Stream, StreamExt, TryStreamExt};
 use safecast::AsType;
 
 use super::index::collate::Collate;
@@ -20,6 +21,9 @@ pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, Arc<DirReadGuardOwned<FE
 
 /// A write guard acquired on a [`TableLock`]
 pub type TableWriteGuard<S, IS, C, FE> = Table<S, IS, C, DirWriteGuardOwned<FE>>;
+
+/// A stream of table rows
+pub type Rows<V> = Pin<Box<dyn Stream<Item = Result<Vec<V>, io::Error>> + Send>>;
 
 /// A futures-aware read-write lock on a [`Table`]
 pub struct TableLock<S, IS, C, FE> {
@@ -324,100 +328,232 @@ where
 
     /// Construct a [`Stream`] of the values of the `selected` columns within the given `range`.
     pub fn rows(
-        mut self,
+        self,
         range: Range<S::Id, S::Value>,
         order: &[S::Id],
         reverse: bool,
         selected: Option<&[S::Id]>,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<Vec<S::Value>, io::Error>> + Send>>, io::Error>
-    {
-        assert!(selected.is_none(), "not yet implemented");
-
+    ) -> Result<Rows<S::Value>, io::Error> {
         #[cfg(feature = "logging")]
         log::debug!("Table::rows");
 
         let mut plan = self.schema.plan_query(order, &range)?;
 
-        let mut range = range.into_inner();
+        let global_columns = selected.unwrap_or_else(|| self.schema.primary().columns());
+        let mut global_order = order;
+        let mut global_range = range.into_inner();
 
-        if plan.indices.is_empty() {
-            let index_range = extract_range(self.primary.schema(), &mut range);
+        let mut local_keys: Option<Rows<S::Value>> = None;
+        let mut local_columns: Option<&[S::Id]> = None;
 
-            assert!(
-                range.is_empty(),
-                "Schema::plan_query failed to cover the requested range"
-            );
+        // for each index in the plan:
+        //   construct the index order and range
+        //   if there are still global order and range constraints unhandled:
+        //     (merge the previous index and) group the index by the order+range columns
+        //     reset the local column selection
+        //   else:
+        //     (merge the previous index and) select the keys from the index
+        //     reset the local column selection
 
-            return Ok(Box::pin(self.primary.keys(index_range, reverse)));
+        if let Some(index_id) = plan.indices.pop_front() {
+            let index = self.auxiliary.get(index_id).expect("index");
+            let index_order = index
+                .schema()
+                .columns()
+                .iter()
+                .zip(global_order)
+                .take_while(|(ic, oc)| ic == oc)
+                .count();
+
+            let index_range = index_range_for(index.schema().columns(), &mut global_range);
+
+            global_order = &global_order[index_order..];
+
+            if plan.indices.is_empty() {
+                local_keys = Some(Box::pin(index.clone().keys(index_range, reverse)));
+                local_columns = Some(index.schema().columns());
+            } else {
+                let columns = &global_order[..index_order];
+                let groups = index.clone().group_by(index_range, columns, reverse)?;
+
+                local_keys = Some(Box::pin(groups));
+                local_columns = Some(columns);
+            }
         }
 
-        let first_index_id = plan.indices.pop_front().expect("table index ID");
-        let index = self.auxiliary.remove(first_index_id).expect("index");
-        let index_range = extract_range(index.schema(), &mut range);
+        while let Some(index_id) = plan.indices.pop_front() {
+            let index = self.auxiliary.get(index_id).expect("index");
+            let keys = local_keys.take().expect("keys");
+            let columns = local_columns.expect("local columns").to_vec();
 
-        let pk_indices = self
-            .schema
-            .key()
-            .iter()
-            .map(|key_col_name| {
-                index
-                    .schema()
-                    .columns()
+            let column_range = if columns.len() < index.schema().columns().len() {
+                global_range.remove(columns.last().expect("range column"))
+            } else {
+                None
+            };
+
+            let index_columns = index.schema().columns().to_vec();
+            let index_order = index_columns
+                .iter()
+                .zip(global_order)
+                .take_while(|(ic, oc)| ic == oc)
+                .count();
+
+            let index = index.clone();
+            let merge_source = keys.map_ok(move |key| {
+                let mut prefix = Vec::<S::Value>::with_capacity(index_columns.len());
+
+                // TODO: would it be more efficient to use a HashMap?
+                for index_col_name in &index_columns {
+                    for (key_col_name, value) in columns.iter().zip(&key) {
+                        if index_col_name == key_col_name {
+                            prefix.push(value.clone());
+                        }
+                    }
+                }
+
+                if let Some(column_range) = column_range.clone() {
+                    match column_range {
+                        ColumnRange::Eq(value) => {
+                            prefix.push(value);
+                            index::Range::from_prefix(prefix)
+                        }
+                        ColumnRange::In(bounds) => index::Range::with_bounds(prefix, bounds),
+                    }
+                } else {
+                    index::Range::from_prefix(prefix)
+                }
+            });
+
+            local_keys = if plan.indices.is_empty() {
+                local_columns = self
+                    .auxiliary
+                    .get(index_id)
+                    .map(|index| index.schema().columns());
+
+                global_order = &global_order[index_order..];
+
+                let keys = merge_source
+                    .map(move |result| result.map(|range| index.clone().keys(range, reverse)))
+                    .try_flatten();
+
+                Some(Box::pin(keys))
+            } else {
+                local_columns = Some(&global_order[..index_order]);
+                let columns = global_order[..index_order].to_vec();
+                global_order = &global_order[index_order..];
+
+                let keys = merge_source
+                    .map(move |result| {
+                        result.and_then(|range| index.clone().group_by(range, &columns, reverse))
+                    })
+                    .try_flatten();
+
+                Some(Box::pin(keys))
+            }
+        }
+
+        // if the local column selection includes the global column selection:
+        //   return the index key stream with the global column selection
+        // else:
+        //   for each selected key in the index, construct a range of the primary index
+        //   select a stream of that range
+        //   flatten the streams
+
+        if let Some(local_columns) = local_columns {
+            let local_keys = local_keys.expect("keys");
+
+            let selected_columns_present = global_columns
+                .iter()
+                .all(|col_name| local_columns.contains(col_name));
+
+            if selected_columns_present {
+                let local_columns = local_columns.to_vec();
+                let global_columns = global_columns.to_vec();
+                let rows = local_keys.map_ok(move |key| {
+                    let mut row = Vec::with_capacity(key.len());
+
+                    // TODO: would it be more efficient to use a HashMap?
+                    for col_name in &global_columns {
+                        for (key_col_name, value) in local_columns.iter().zip(&key) {
+                            if col_name == key_col_name {
+                                row.push(value.clone());
+                                break;
+                            }
+                        }
+                    }
+
+                    row
+                });
+
+                Ok(Box::pin(rows))
+            } else {
+                let primary = self.primary.clone();
+                let pk_columns = self.schema.key().to_vec();
+                assert!(pk_columns
                     .iter()
-                    .position(|col_name| col_name == key_col_name)
-                    .expect("key col index")
-            })
-            .collect::<Vec<usize>>();
+                    .all(|col_name| local_columns.contains(col_name)));
 
-        let primary = Arc::new(self.primary);
+                let local_columns = local_columns.to_vec();
+                let rows = local_keys
+                    .map_ok(move |key| {
+                        let mut pk = Vec::with_capacity(pk_columns.len());
 
-        let keys = index
-            .keys(index_range, reverse)
-            .map_ok(move |index_key| {
-                pk_indices
-                    .iter()
-                    .copied()
-                    .map(|i| index_key[i].clone())
-                    .collect::<Key<S::Value>>()
-            })
-            .map_ok(move |pk| {
-                let primary = primary.clone();
-                async move { primary.first(&index::Range::from_prefix(pk)).await }
-            })
-            .try_buffered(num_cpus::get())
-            .map_ok(|maybe_row| maybe_row.expect("row"));
+                        for col_name in &pk_columns {
+                            for (key_col_name, value) in local_columns.iter().zip(&key) {
+                                if col_name == key_col_name {
+                                    pk.push(value.clone());
+                                    break;
+                                }
+                            }
+                        }
 
-        Ok(Box::pin(keys))
+                        pk
+                    })
+                    .map(move |result| {
+                        let primary = primary.clone();
+
+                        result.map(move |pk| async move {
+                            let pk = index::Range::from_prefix(pk);
+                            let row = primary.first(&pk).await?;
+                            Ok(row.expect("row"))
+                        })
+                    })
+                    .try_buffered(num_cpus::get());
+
+                Ok(Box::pin(rows))
+            }
+        } else {
+            assert!(self.primary.schema().columns().starts_with(global_order));
+            let range = index_range_for(self.primary.schema().columns(), &mut global_range);
+            assert!(global_range.is_empty());
+            let rows = self.primary.keys(range, reverse);
+            Ok(Box::pin(rows))
+        }
     }
 }
 
 #[inline]
-fn extract_range<IS: IndexSchema>(
-    schema: &IS,
-    range: &mut HashMap<IS::Id, ColumnRange<IS::Value>>,
-) -> super::index::Range<IS::Value> {
-    if range.is_empty() {
-        super::index::Range::default()
-    } else {
-        let columns = schema.columns();
-        let mut prefix = Vec::with_capacity(columns.len());
-        for col_name in columns {
-            if let Some(col_range) = range.remove(col_name) {
-                match col_range {
-                    ColumnRange::Eq(value) => {
-                        prefix.push(value);
-                    }
-                    ColumnRange::In(col_bounds) => {
-                        return super::index::Range::with_bounds(prefix, col_bounds);
-                    }
+fn index_range_for<K: Eq + Hash, V>(
+    columns: &[K],
+    range: &mut HashMap<K, ColumnRange<V>>,
+) -> index::Range<V> {
+    let mut prefix = Vec::with_capacity(range.len());
+
+    for col_name in columns {
+        if let Some(col_range) = range.remove(col_name) {
+            match col_range {
+                ColumnRange::Eq(value) => {
+                    prefix.push(value);
                 }
-            } else {
-                break;
+                ColumnRange::In(bounds) => {
+                    return index::Range::with_bounds(prefix, bounds);
+                }
             }
         }
-
-        super::index::Range::from_prefix(prefix)
     }
+
+    index::Range::from_prefix(prefix)
 }
 
 impl<S, IS, C, FE> Table<S, IS, C, DirWriteGuardOwned<FE>> {

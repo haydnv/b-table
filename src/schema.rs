@@ -84,11 +84,15 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
                 for col_name in index.columns() {
                     if covered_order + index_covers < order.len() {
                         if &order[covered_order + index_covers] == col_name {
-                            if range.columns.contains_key(col_name) {
-                                covered_range.insert(col_name);
-                            }
-
                             index_covers += 1;
+
+                            if let Some(col_range) = range.get(col_name) {
+                                covered_range.insert(col_name);
+
+                                if col_range.is_range() {
+                                    break;
+                                }
+                            }
                         } else {
                             break;
                         }
@@ -98,8 +102,12 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
                 }
             } else {
                 for col_name in index.columns() {
-                    if range.columns.contains_key(col_name) {
+                    if let Some(col_range) = range.get(col_name) {
                         covered_range.insert(col_name);
+
+                        if col_range.is_range() {
+                            break;
+                        }
                     }
                 }
             }
@@ -155,7 +163,7 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
 
 /// The schema of a table index
 pub trait IndexSchema: BTreeSchema + Clone {
-    type Id: Hash + Eq + fmt::Debug + fmt::Display;
+    type Id: Hash + Eq + Clone + fmt::Debug + fmt::Display;
 
     /// Borrow the list of columns specified by this schema.
     fn columns(&self) -> &[Self::Id];
@@ -209,7 +217,7 @@ pub trait IndexSchema: BTreeSchema + Clone {
 
 /// The schema of a [`Table`]
 pub trait Schema: Eq + Sized + fmt::Debug {
-    type Id: Hash + Eq + fmt::Debug + fmt::Display;
+    type Id: Hash + Eq + Clone + Send + Sync + fmt::Debug + fmt::Display + 'static;
     type Error: std::error::Error + From<io::Error>;
     type Value: Clone + Eq + Send + Sync + fmt::Debug + 'static;
     type Index: IndexSchema<Error = Self::Error, Id = Self::Id, Value = Self::Value>
@@ -284,6 +292,15 @@ pub trait Schema: Eq + Sized + fmt::Debug {
 pub enum ColumnRange<V> {
     Eq(V),
     In((Bound<V>, Bound<V>)),
+}
+
+impl<V> ColumnRange<V> {
+    fn is_range(&self) -> bool {
+        match self {
+            Self::Eq(_) => false,
+            Self::In(_) => true,
+        }
+    }
 }
 
 impl<C> OverlapsRange<Self, C> for ColumnRange<C::Value>
