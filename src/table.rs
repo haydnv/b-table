@@ -326,6 +326,7 @@ where
         }
     }
 
+    // TODO: can this be broken up into smaller methods, or a helper data structure?
     /// Construct a [`Stream`] of the values of the `selected` columns within the given `range`.
     pub fn rows(
         &self,
@@ -399,18 +400,10 @@ where
                 .take_while(|(ic, oc)| ic == oc)
                 .count();
 
+            let extract_prefix = prefix_extractor(&columns, &index_columns);
             let index = index.clone();
             let merge_source = keys.map_ok(move |key| {
-                let mut prefix = Vec::<S::Value>::with_capacity(index_columns.len());
-
-                // TODO: would it be more efficient to use a HashMap?
-                for index_col_name in &index_columns {
-                    for (key_col_name, value) in columns.iter().zip(&key) {
-                        if index_col_name == key_col_name {
-                            prefix.push(value.clone());
-                        }
-                    }
-                }
+                let mut prefix = extract_prefix(key);
 
                 if let Some(column_range) = column_range.clone() {
                     match column_range {
@@ -468,48 +461,20 @@ where
                 .all(|col_name| local_columns.contains(col_name));
 
             if selected_columns_present {
-                let local_columns = local_columns.to_vec();
-                let global_columns = global_columns.to_vec();
-                let rows = local_keys.map_ok(move |key| {
-                    let mut row = Vec::with_capacity(key.len());
-
-                    // TODO: would it be more efficient to use a HashMap?
-                    for col_name in &global_columns {
-                        for (key_col_name, value) in local_columns.iter().zip(&key) {
-                            if col_name == key_col_name {
-                                row.push(value.clone());
-                                break;
-                            }
-                        }
-                    }
-
-                    row
-                });
-
+                let extract_row = prefix_extractor(local_columns, global_columns);
+                let rows = local_keys.map_ok(extract_row);
                 Ok(Box::pin(rows))
             } else {
-                let primary = self.primary.clone();
-                let pk_columns = self.schema.key().to_vec();
-                assert!(pk_columns
+                assert!(self
+                    .schema
+                    .key()
                     .iter()
                     .all(|col_name| local_columns.contains(col_name)));
 
-                let local_columns = local_columns.to_vec();
+                let extract_pk = prefix_extractor(local_columns, self.schema.key());
+                let primary = self.primary.clone();
                 let rows = local_keys
-                    .map_ok(move |key| {
-                        let mut pk = Vec::with_capacity(pk_columns.len());
-
-                        for col_name in &pk_columns {
-                            for (key_col_name, value) in local_columns.iter().zip(&key) {
-                                if col_name == key_col_name {
-                                    pk.push(value.clone());
-                                    break;
-                                }
-                            }
-                        }
-
-                        pk
-                    })
+                    .map_ok(extract_pk)
                     .map(move |result| {
                         let primary = primary.clone();
 
@@ -530,6 +495,37 @@ where
             let rows = self.primary.clone().keys(range, reverse);
             Ok(Box::pin(rows))
         }
+    }
+}
+
+fn prefix_extractor<K, V>(columns_in: &[K], columns_out: &[K]) -> impl Fn(Vec<V>) -> Vec<V>
+where
+    K: PartialEq,
+{
+    let mut indices = Vec::with_capacity(columns_out.len());
+
+    for name_out in columns_out
+        .iter()
+        .take_while(|name| columns_in.contains(name))
+    {
+        let mut index = columns_in
+            .iter()
+            .position(|name_in| name_in == name_out)
+            .expect("index");
+
+        index -= indices.iter().copied().filter(|i| *i < index).count();
+
+        indices.push(index);
+    }
+
+    move |mut key| {
+        let mut prefix = Vec::with_capacity(indices.len() + 1);
+
+        for i in indices.iter().copied() {
+            prefix.push(key.remove(i));
+        }
+
+        prefix
     }
 }
 
