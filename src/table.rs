@@ -298,7 +298,7 @@ where
     Range<S::Id, S::Value>: fmt::Debug,
 {
     /// Count how many rows in this [`Table`] lie within the given `range`.
-    pub async fn count(self, range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
+    pub async fn count(&self, range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
         if range.is_default() {
             self.primary.count(&index::Range::default()).await
         } else {
@@ -314,7 +314,7 @@ where
     }
 
     /// Return `true` if the given [`Range`] of this [`Table`] does not contain any rows.
-    pub async fn is_empty(self, range: Range<S::Id, S::Value>) -> Result<bool, io::Error> {
+    pub async fn is_empty(&self, range: Range<S::Id, S::Value>) -> Result<bool, io::Error> {
         if range.is_default() {
             self.primary.is_empty(&index::Range::default()).await
         } else {
@@ -328,7 +328,7 @@ where
 
     /// Construct a [`Stream`] of the values of the `selected` columns within the given `range`.
     pub fn rows(
-        self,
+        &self,
         range: Range<S::Id, S::Value>,
         order: &[S::Id],
         reverse: bool,
@@ -527,7 +527,7 @@ where
             assert!(self.primary.schema().columns().starts_with(global_order));
             let range = index_range_for(self.primary.schema().columns(), &mut global_range);
             assert!(global_range.is_empty());
-            let rows = self.primary.keys(range, reverse);
+            let rows = self.primary.clone().keys(range, reverse);
             Ok(Box::pin(rows))
         }
     }
