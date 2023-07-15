@@ -265,6 +265,60 @@ where
         self.primary.contains(key).await
     }
 
+    /// Return the first row in the given `range`, if any.
+    pub async fn first(
+        &self,
+        range: Range<S::Id, S::Value>,
+    ) -> Result<Option<Vec<S::Value>>, io::Error> {
+        let plan = self.schema.plan_query(&[], &range)?;
+        self.first_inner(&plan, range).await
+    }
+
+    async fn first_inner<'a>(
+        &'a self,
+        plan: &'a QueryPlan<'a, S>,
+        range: Range<S::Id, S::Value>,
+    ) -> Result<Option<Vec<S::Value>>, io::Error> {
+        let mut plan = plan.indices.iter();
+        let mut range = range.into_inner();
+
+        if let Some(index_id) = plan.next() {
+            let index = self.auxiliary.get(*index_id).expect("index");
+            let mut columns = index.schema().columns();
+            let index_range = index_range_for(columns, &mut range);
+            if let Some(mut first) = index.first(&index_range).await? {
+                while let Some(index_id) = plan.next() {
+                    let index = self.auxiliary.get(*index_id).expect("index");
+                    let extractor = prefix_extractor(columns, index.schema().columns());
+                    let prefix = extractor(first);
+                    columns = &index.schema().columns()[..prefix.len()];
+
+                    let column_range = columns.get(prefix.len()).and_then(|col| range.remove(col));
+                    let index_range = inner_range(prefix, column_range);
+
+                    if let Some(row) = index.first(&index_range).await? {
+                        first = row;
+                    } else {
+                        return Ok(None);
+                    }
+                }
+
+                range.extend(
+                    columns
+                        .iter()
+                        .cloned()
+                        .zip(first.into_iter().map(ColumnRange::Eq)),
+                );
+            } else {
+                return Ok(None);
+            }
+        };
+
+        let index_range = index_range_for(self.primary.schema().columns(), &mut range);
+        assert!(range.is_empty());
+        self.primary.first(&index_range).await
+    }
+
     /// Look up a row by its `key`.
     pub async fn get_row(&self, key: Key<S::Value>) -> Result<Option<Vec<S::Value>>, S::Error> {
         let key = self.schema.validate_key(key)?;
@@ -282,7 +336,7 @@ where
 
         self.primary
             .first(&b_tree::Range::from_prefix(key))
-            .map_ok(|maybe_row| maybe_row.map(|row| row[key_len..].to_vec()))
+            .map_ok(|maybe_row| maybe_row.map(|mut row| row.drain(key_len..).collect()))
             .map_err(S::Error::from)
             .await
     }
@@ -302,7 +356,7 @@ where
         if range.is_default() {
             self.primary.count(&index::Range::default()).await
         } else {
-            // TODO: optimize & avoid the need to move self
+            // TODO: optimize
             let mut rows = self.rows(range, &[], false, None)?;
 
             let mut count = 0;
@@ -318,7 +372,6 @@ where
         if range.is_default() {
             self.primary.is_empty(&index::Range::default()).await
         } else {
-            // TODO: optimize & avoid the need to move self
             let mut rows = self.rows(range, &[], false, None)?;
             rows.try_next()
                 .map_ok(|maybe_row| maybe_row.is_none())
@@ -385,7 +438,7 @@ where
         while let Some(index_id) = plan.indices.pop_front() {
             let index = self.auxiliary.get(index_id).expect("index");
             let keys = local_keys.take().expect("keys");
-            let columns = local_columns.expect("local columns").to_vec();
+            let columns = local_columns.expect("local columns");
 
             let column_range = if columns.len() < index.schema().columns().len() {
                 global_range.remove(columns.last().expect("range column"))
@@ -393,30 +446,17 @@ where
                 None
             };
 
-            let index_columns = index.schema().columns().to_vec();
+            let index_columns = index.schema().columns();
             let index_order = index_columns
                 .iter()
                 .zip(global_order)
                 .take_while(|(ic, oc)| ic == oc)
                 .count();
 
-            let extract_prefix = prefix_extractor(&columns, &index_columns);
+            let extract_prefix = prefix_extractor(columns, index_columns);
             let index = index.clone();
-            let merge_source = keys.map_ok(move |key| {
-                let mut prefix = extract_prefix(key);
-
-                if let Some(column_range) = column_range.clone() {
-                    match column_range {
-                        ColumnRange::Eq(value) => {
-                            prefix.push(value);
-                            index::Range::from_prefix(prefix)
-                        }
-                        ColumnRange::In(bounds) => index::Range::with_bounds(prefix, bounds),
-                    }
-                } else {
-                    index::Range::from_prefix(prefix)
-                }
-            });
+            let merge_source =
+                keys.map_ok(move |key| inner_range(extract_prefix(key), column_range.clone()));
 
             local_keys = if plan.indices.is_empty() {
                 local_columns = self
@@ -476,6 +516,7 @@ where
                 let rows = local_keys
                     .map_ok(extract_pk)
                     .map(move |result| {
+                        // this clone is necessary in order run multiple concurrent lookups
                         let primary = primary.clone();
 
                         result.map(move |pk| async move {
@@ -495,6 +536,50 @@ where
             let rows = self.primary.clone().keys(range, reverse);
             Ok(Box::pin(rows))
         }
+    }
+
+    /// Consume this [`TableReadGuard`] to construct a [`Stream`] of all the rows in the [`Table`].
+    pub fn into_rows(self) -> Rows<S::Value> {
+        let rows = self.primary.keys(index::Range::default(), false);
+        Box::pin(rows)
+    }
+}
+
+#[inline]
+fn index_range_for<K: Eq + Hash, V>(
+    columns: &[K],
+    range: &mut HashMap<K, ColumnRange<V>>,
+) -> index::Range<V> {
+    let mut prefix = Vec::with_capacity(range.len());
+
+    for col_name in columns {
+        if let Some(col_range) = range.remove(col_name) {
+            match col_range {
+                ColumnRange::Eq(value) => {
+                    prefix.push(value);
+                }
+                ColumnRange::In(bounds) => {
+                    return index::Range::with_bounds(prefix, bounds);
+                }
+            }
+        }
+    }
+
+    index::Range::from_prefix(prefix)
+}
+
+#[inline]
+fn inner_range<V>(mut prefix: Vec<V>, column_range: Option<ColumnRange<V>>) -> index::Range<V> {
+    if let Some(column_range) = column_range {
+        match column_range {
+            ColumnRange::Eq(value) => {
+                prefix.push(value);
+                index::Range::from_prefix(prefix)
+            }
+            ColumnRange::In(bounds) => index::Range::with_bounds(prefix, bounds),
+        }
+    } else {
+        index::Range::from_prefix(prefix)
     }
 }
 
@@ -529,29 +614,6 @@ where
     }
 }
 
-#[inline]
-fn index_range_for<K: Eq + Hash, V>(
-    columns: &[K],
-    range: &mut HashMap<K, ColumnRange<V>>,
-) -> index::Range<V> {
-    let mut prefix = Vec::with_capacity(range.len());
-
-    for col_name in columns {
-        if let Some(col_range) = range.remove(col_name) {
-            match col_range {
-                ColumnRange::Eq(value) => {
-                    prefix.push(value);
-                }
-                ColumnRange::In(bounds) => {
-                    return index::Range::with_bounds(prefix, bounds);
-                }
-            }
-        }
-    }
-
-    index::Range::from_prefix(prefix)
-}
-
 impl<S, IS, C, FE> Table<S, IS, C, DirWriteGuardOwned<FE>> {
     /// Downgrade this write lock to a read lock.
     pub fn downgrade(self) -> Table<S, IS, C, Arc<DirReadGuardOwned<FE>>> {
@@ -573,8 +635,7 @@ where
     C: Collate<Value = S::Value> + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static,
     <S as Schema>::Index: Send + Sync,
-    Node<S::Value>: FileLoad + fmt::Debug,
-    Range<S::Id, S::Value>: fmt::Debug,
+    Node<S::Value>: FileLoad,
 {
     /// Delete a row from this [`Table`] by its `key`.
     /// Returns `true` if the given `key` was present.
@@ -604,8 +665,13 @@ where
     }
 
     /// Delete all rows in the given `range` from this [`Table`].
-    pub async fn delete_range(&mut self, _range: Range<S::Id, S::Value>) -> Result<(), S::Error> {
-        // TODO: formulate a query plan then follow it to stitch together multiple indices
+    pub async fn delete_range(
+        &mut self,
+        _range: Range<S::Id, S::Value>,
+    ) -> Result<usize, S::Error> {
+        #[cfg(feature = "logging")]
+        log::debug!("Table::delete_range");
+
         todo!()
     }
 

@@ -1,3 +1,4 @@
+pub use b_tree::Collator;
 pub use index::collate;
 pub use schema::*;
 pub use table::*;

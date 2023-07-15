@@ -130,9 +130,9 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
         debug_assert!(covered_order <= order.len());
 
         let index_columns = get_index(self.schema, index_id).columns();
-        if index_columns.is_empty() {
-            false
-        } else if covered_order < order.len() {
+        assert!(!index_columns.is_empty());
+
+        if covered_order < order.len() {
             index_columns.starts_with(&order[covered_order..covered_order + 1])
         } else {
             range.columns.contains_key(&index_columns[0])
