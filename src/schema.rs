@@ -118,6 +118,10 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
         (covered_order, covered_range)
     }
 
+    pub fn to_vec(&self) -> Vec<String> {
+        self.indices.iter().map(|s| (*s).to_owned()).collect()
+    }
+
     fn is_complete(&self, order: &[S::Id], range: &Range<S::Id, S::Value>) -> bool {
         let (covered_order, covered_range) = self.covers(order, range);
         debug_assert!(covered_order <= order.len());

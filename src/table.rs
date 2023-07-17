@@ -271,24 +271,24 @@ where
         range: Range<S::Id, S::Value>,
     ) -> Result<Option<Vec<S::Value>>, io::Error> {
         let plan = self.schema.plan_query(&[], &range)?;
-        self.first_inner(&plan, range).await
+        self.first_inner(&plan.to_vec(), range).await
     }
 
     async fn first_inner<'a>(
         &'a self,
-        plan: &'a QueryPlan<'a, S>,
+        plan: &'a [String],
         range: Range<S::Id, S::Value>,
     ) -> Result<Option<Vec<S::Value>>, io::Error> {
-        let mut plan = plan.indices.iter();
+        let mut plan = plan.iter();
         let mut range = range.into_inner();
 
         if let Some(index_id) = plan.next() {
-            let index = self.auxiliary.get(*index_id).expect("index");
+            let index = self.auxiliary.get(index_id.as_str()).expect("index");
             let mut columns = index.schema().columns();
             let index_range = index_range_for(columns, &mut range);
             if let Some(mut first) = index.first(&index_range).await? {
                 while let Some(index_id) = plan.next() {
-                    let index = self.auxiliary.get(*index_id).expect("index");
+                    let index = self.auxiliary.get(index_id.as_str()).expect("index");
                     let extractor = prefix_extractor(columns, index.schema().columns());
                     let prefix = extractor(first);
                     columns = &index.schema().columns()[..prefix.len()];
@@ -394,6 +394,14 @@ where
         let mut plan = self.schema.plan_query(order, &range)?;
 
         let global_columns = selected.unwrap_or_else(|| self.schema.primary().columns());
+
+        if global_columns.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty column selection",
+            ));
+        }
+
         let mut global_order = order;
         let mut global_range = range.into_inner();
 
@@ -441,7 +449,7 @@ where
             let columns = local_columns.expect("local columns");
 
             let column_range = if columns.len() < index.schema().columns().len() {
-                global_range.remove(columns.last().expect("range column"))
+                columns.last().and_then(|col| global_range.remove(col))
             } else {
                 None
             };
@@ -665,14 +673,21 @@ where
     }
 
     /// Delete all rows in the given `range` from this [`Table`].
-    pub async fn delete_range(
-        &mut self,
-        _range: Range<S::Id, S::Value>,
-    ) -> Result<usize, S::Error> {
+    pub async fn delete_range(&mut self, range: Range<S::Id, S::Value>) -> Result<usize, S::Error> {
         #[cfg(feature = "logging")]
         log::debug!("Table::delete_range");
 
-        todo!()
+        let key_len = self.schema.key().len();
+        let plan = self.schema.plan_query(&[], &range)?.to_vec();
+
+        let mut deleted = 0;
+        while let Some(row) = self.first_inner(&plan, range.clone()).await? {
+            let key = row[..key_len].to_vec();
+            self.delete_row(key).await?;
+            deleted += 1;
+        }
+
+        Ok(deleted)
     }
 
     /// Delete all rows from the `other` table from this one.
