@@ -51,7 +51,7 @@ where
                         *this.pending = Some(key[..*this.columns].to_vec());
                     }
                 },
-                None => break None,
+                None => break this.pending.take().map(Ok),
                 Some(Err(cause)) => break Some(Err(cause)),
             }
         })
