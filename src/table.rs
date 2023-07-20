@@ -427,20 +427,29 @@ where
                 .take_while(|(ic, oc)| ic == oc)
                 .count();
 
-            let index_range = index_range_for(index.schema().columns(), &mut global_range);
+            debug_assert!(index
+                .schema()
+                .columns()
+                .starts_with(&global_order[..index_order]));
 
-            global_order = &global_order[index_order..];
+            let index_range = index_range_for(index.schema().columns(), &mut global_range);
 
             if plan.indices.is_empty() {
                 local_keys = Some(Box::pin(index.clone().keys(index_range, reverse)));
                 local_columns = Some(index.schema().columns());
             } else {
                 let columns = &global_order[..index_order];
+
+                #[cfg(feature = "logging")]
+                log::trace!("group columns {columns:?} from {index:?}");
+
                 let groups = index.clone().group_by(index_range, columns, reverse)?;
 
                 local_keys = Some(Box::pin(groups));
                 local_columns = Some(columns);
             }
+
+            global_order = &global_order[index_order..];
         }
 
         while let Some(index_id) = plan.indices.pop_front() {
@@ -460,6 +469,8 @@ where
                 .zip(global_order)
                 .take_while(|(ic, oc)| ic == oc)
                 .count();
+
+            debug_assert_eq!(index_columns[..index_order], global_order[..index_order]);
 
             let extract_prefix = prefix_extractor(columns, index_columns);
             let index = index.clone();

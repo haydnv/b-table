@@ -175,6 +175,12 @@ where
     }
 }
 
+impl<S: IndexSchema, C: Collate<Value = S::Value>, G> fmt::Debug for Index<S, C, G> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "index on columns {:?}", self.btree.schema().columns())
+    }
+}
+
 impl<S, C, FE> IndexWriteGuard<S, C, FE> {
     pub fn downgrade(self) -> IndexReadGuard<S, C, FE> {
         IndexReadGuard {
