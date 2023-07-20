@@ -435,6 +435,9 @@ where
             let index_range = index_range_for(index.schema().columns(), &mut global_range);
 
             if plan.indices.is_empty() {
+                #[cfg(feature = "logging")]
+                log::trace!("read from {index:?}");
+
                 local_keys = Some(Box::pin(index.clone().keys(index_range, reverse)));
                 local_columns = Some(index.schema().columns());
             } else {
@@ -478,6 +481,9 @@ where
                 keys.map_ok(move |key| inner_range(extract_prefix(key), column_range.clone()));
 
             local_keys = if plan.indices.is_empty() {
+                #[cfg(feature = "logging")]
+                log::trace!("read from {index:?}");
+
                 local_columns = self
                     .auxiliary
                     .get(index_id)
@@ -491,6 +497,12 @@ where
 
                 Some(Box::pin(keys))
             } else {
+                #[cfg(feature = "logging")]
+                log::trace!(
+                    "group {columns:?} from {index:?}",
+                    columns = &global_order[..index_order]
+                );
+
                 local_columns = Some(&global_order[..index_order]);
                 let columns = global_order[..index_order].to_vec();
                 global_order = &global_order[index_order..];
