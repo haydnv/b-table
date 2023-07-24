@@ -477,41 +477,21 @@ where
             let merge_source =
                 keys.map_ok(move |key| inner_range(extract_prefix(key), column_range.clone()));
 
-            local_keys = if plan.indices.is_empty() {
-                #[cfg(feature = "logging")]
-                log::trace!("read from {index:?}");
+            #[cfg(feature = "logging")]
+            log::trace!("read from {index:?}");
 
-                local_columns = self
-                    .auxiliary
-                    .get(index_id)
-                    .map(|index| index.schema().columns());
+            local_columns = self
+                .auxiliary
+                .get(index_id)
+                .map(|index| index.schema().columns());
 
-                global_order = &global_order[index_order..];
+            global_order = &global_order[index_order..];
 
-                let keys = merge_source
-                    .map(move |result| result.map(|range| index.clone().keys(range, reverse)))
-                    .try_flatten();
+            let keys = merge_source
+                .map(move |result| result.map(|range| index.clone().keys(range, reverse)))
+                .try_flatten();
 
-                Some(Box::pin(keys))
-            } else {
-                #[cfg(feature = "logging")]
-                log::trace!(
-                    "group {columns:?} from {index:?}",
-                    columns = &global_order[..index_order]
-                );
-
-                local_columns = Some(&global_order[..index_order]);
-                let columns = global_order[..index_order].to_vec();
-                global_order = &global_order[index_order..];
-
-                let keys = merge_source
-                    .map(move |result| {
-                        result.and_then(|range| index.clone().group_by(range, &columns, reverse))
-                    })
-                    .try_flatten();
-
-                Some(Box::pin(keys))
-            }
+            local_keys = Some(Box::pin(keys));
         }
 
         // if the local column selection includes the global column selection:

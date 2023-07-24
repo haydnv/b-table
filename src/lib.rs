@@ -3,7 +3,6 @@ pub use index::collate;
 pub use schema::*;
 pub use table::*;
 
-mod group;
 mod index;
 mod schema;
 #[cfg(feature = "stream")]
