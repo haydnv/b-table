@@ -22,9 +22,9 @@ required-features = ["stream"]
 
 [dependencies]
 async-trait = { version = "0.1", optional = true }
-b-tree = { path = "../b-tree" }
+b-tree = "0.2"
 destream = { version = "0.7", optional = true }
-freqfs = { path = "../freqfs" }
+freqfs = "~0.8.1"
 futures = "0.3"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }
 num_cpus = "1.15"
