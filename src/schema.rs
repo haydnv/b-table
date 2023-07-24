@@ -24,7 +24,7 @@ impl<'a, S> Clone for QueryPlan<'a, S> {
 }
 
 impl<'a, S: Schema> QueryPlan<'a, S> {
-    fn empty(schema: &'a S) -> Self {
+    fn default(schema: &'a S) -> Self {
         Self {
             schema,
             indices: VecDeque::default(),
@@ -250,30 +250,47 @@ pub trait Schema: Eq + Sized + fmt::Debug {
         range: &Range<Self::Id, Self::Value>,
     ) -> Result<QueryPlan<'a, Self>, io::Error> {
         if self.primary().columns().starts_with(order) && self.primary().supports(range) {
-            return Ok(QueryPlan::empty(self));
+            return Ok(QueryPlan::default(self));
+        } else if self.auxiliary().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "this table has no auxiliary indices to support order and range queries",
+            ));
         }
 
         let mut candidates = VecDeque::with_capacity(self.auxiliary().len() * 2);
 
         for (name, _index) in self.auxiliary() {
             if let Some(candidate) = QueryPlan::with_index(self, order, range, name) {
+                #[cfg(feature = "logging")]
+                log::trace!("index {name} supports {range:?} with order {order:?}");
+
                 if candidate.is_complete(order, range) {
                     return Ok(candidate);
                 } else {
                     candidates.push_back(candidate);
                 }
+            } else {
+                #[cfg(feature = "logging")]
+                log::trace!("index {name} does not support {range:?} with order {order:?}");
             }
         }
 
         while let Some(plan) = candidates.pop_front() {
             for (name, _index) in self.auxiliary() {
                 if plan.supports(name) && plan.needs(order, range, name) {
+                    #[cfg(feature = "logging")]
+                    log::trace!("index {name} supports {range:?} with order {order:?}");
+
                     let candidate = plan.clone_and_push(name);
                     if candidate.is_complete(order, range) {
                         return Ok(candidate);
                     } else {
                         candidates.push_back(candidate);
                     }
+                } else {
+                    #[cfg(feature = "logging")]
+                    log::trace!("index {name} does not {range:?} with order {order:?}");
                 }
             }
         }

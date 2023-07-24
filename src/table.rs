@@ -389,7 +389,7 @@ where
         selected: Option<&[S::Id]>,
     ) -> Result<Rows<S::Value>, io::Error> {
         #[cfg(feature = "logging")]
-        log::debug!("Table::rows");
+        log::debug!("Table::rows with order {order:?}");
 
         let mut plan = self.schema.plan_query(order, &range)?;
 
@@ -434,24 +434,11 @@ where
 
             let index_range = index_range_for(index.schema().columns(), &mut global_range);
 
-            if plan.indices.is_empty() {
-                #[cfg(feature = "logging")]
-                log::trace!("read from {index:?}");
+            #[cfg(feature = "logging")]
+            log::trace!("read from {index:?}");
 
-                local_keys = Some(Box::pin(index.clone().keys(index_range, reverse)));
-                local_columns = Some(index.schema().columns());
-            } else {
-                let columns = &global_order[..index_order];
-
-                #[cfg(feature = "logging")]
-                log::trace!("group columns {columns:?} from {index:?}");
-
-                let groups = index.clone().group_by(index_range, columns, reverse)?;
-
-                local_keys = Some(Box::pin(groups));
-                local_columns = Some(columns);
-            }
-
+            local_keys = Some(Box::pin(index.clone().keys(index_range, reverse)));
+            local_columns = Some(index.schema().columns());
             global_order = &global_order[index_order..];
         }
 
@@ -459,6 +446,9 @@ where
             let index = self.auxiliary.get(index_id).expect("index");
             let keys = local_keys.take().expect("keys");
             let columns = local_columns.expect("local columns");
+
+            #[cfg(feature = "logging")]
+            log::trace!("merge ordered selection {columns:?} with {index:?}");
 
             let column_range = if columns.len() < index.schema().columns().len() {
                 columns.last().and_then(|col| global_range.remove(col))
@@ -475,7 +465,14 @@ where
 
             debug_assert_eq!(index_columns[..index_order], global_order[..index_order]);
 
-            let extract_prefix = prefix_extractor(columns, index_columns);
+            let prefix_len = index_columns
+                .iter()
+                .take_while(|id| columns.contains(id))
+                .count();
+
+            debug_assert!(prefix_len > 0);
+
+            let extract_prefix = prefix_extractor(columns, &index_columns[..prefix_len]);
             let index = index.clone();
             let merge_source =
                 keys.map_ok(move |key| inner_range(extract_prefix(key), column_range.clone()));
@@ -614,10 +611,26 @@ fn inner_range<V>(mut prefix: Vec<V>, column_range: Option<ColumnRange<V>>) -> i
     }
 }
 
-fn prefix_extractor<K, V>(columns_in: &[K], columns_out: &[K]) -> impl Fn(Vec<V>) -> Vec<V>
+fn prefix_extractor<K, V>(
+    columns_in: &[K],
+    columns_out: &[K],
+) -> Box<dyn Fn(Vec<V>) -> Vec<V> + Send>
 where
-    K: PartialEq,
+    K: PartialEq + fmt::Debug,
 {
+    debug_assert!(!columns_out.is_empty());
+    debug_assert!(
+        columns_out.iter().all(|id| columns_in.contains(id)),
+        "{columns_out:?} is not a superset of {columns_in:?}"
+    );
+
+    #[cfg(feature = "logging")]
+    log::trace!("extract columns {columns_out:?} from {columns_in:?}");
+
+    if columns_in == columns_out {
+        return Box::new(|key| key);
+    }
+
     let mut indices = Vec::with_capacity(columns_out.len());
 
     for name_out in columns_out
@@ -634,7 +647,7 @@ where
         indices.push(index);
     }
 
-    move |mut key| {
+    Box::new(move |mut key| {
         let mut prefix = Vec::with_capacity(indices.len() + 1);
 
         for i in indices.iter().copied() {
@@ -642,7 +655,7 @@ where
         }
 
         prefix
-    }
+    })
 }
 
 impl<S, IS, C, FE> Table<S, IS, C, DirWriteGuardOwned<FE>> {
