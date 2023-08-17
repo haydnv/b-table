@@ -105,12 +105,14 @@ where
 
     /// Load an existing [`Table`] with the given `schema` from the given `dir`
     pub fn load(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
-        for (_name, index) in schema.auxiliary() {
-            if !index.columns().ends_with(schema.key()) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "index columns must end with the primary key of the table",
-                ));
+        for (name, index) in schema.auxiliary() {
+            for col_name in schema.key() {
+                if !index.columns().contains(col_name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("index {} is missing primary key column {}", name, col_name),
+                    ));
+                }
             }
         }
 
@@ -148,16 +150,25 @@ where
 {
     /// Lock this [`Table`] for reading.
     pub async fn read(&self) -> TableReadGuard<S, S::Index, C, FE> {
+        #[cfg(feature = "logging")]
+        log::debug!("locking table for reading...");
+
         let schema = self.schema.clone();
 
         // lock the primary key first, separately from the indices, to avoid a deadlock
         let primary = self.primary.read().await;
+
+        #[cfg(feature = "logging")]
+        log::trace!("locked primary index for reading");
 
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in &self.auxiliary {
             let index = index.read().await;
             auxiliary.insert(name.clone(), index);
+
+            #[cfg(feature = "logging")]
+            log::trace!("locked index {name} for reading");
         }
 
         Table {
