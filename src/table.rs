@@ -142,6 +142,13 @@ where
             dir,
         })
     }
+
+    pub async fn sync(&self) -> Result<(), io::Error>
+    where
+        FE: for<'a> freqfs::FileSave<'a>,
+    {
+        self.dir.sync().await
+    }
 }
 
 impl<S: Schema, C, FE: Send + Sync> TableLock<S, S::Index, C, FE>
@@ -180,15 +187,25 @@ where
 
     /// Lock this [`Table`] for reading, without borrowing.
     pub async fn into_read(self) -> TableReadGuard<S, S::Index, C, FE> {
+        #[cfg(feature = "logging")]
+        log::debug!("locking table for reading...");
+
         let schema = self.schema.clone();
 
         // lock the primary key first, separately from the indices, to avoid a deadlock
         let primary = self.primary.into_read().await;
 
+        #[cfg(feature = "logging")]
+        log::trace!("locked primary index for reading");
+
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in self.auxiliary {
             let index = index.into_read().await;
+
+            #[cfg(feature = "logging")]
+            log::trace!("locked index {name} for reading");
+
             auxiliary.insert(name, index);
         }
 
@@ -199,18 +216,57 @@ where
         }
     }
 
+    /// Lock this [`Table`] for reading synchronously, if possible.
+    pub fn try_read(&self) -> Result<TableReadGuard<S, S::Index, C, FE>, io::Error> {
+        #[cfg(feature = "logging")]
+        log::debug!("locking table for reading...");
+
+        let schema = self.schema.clone();
+
+        // lock the primary key first, separately from the indices, to avoid a deadlock
+        let primary = self.primary.try_read()?;
+
+        #[cfg(feature = "logging")]
+        log::trace!("locked primary index for reading");
+
+        // then lock each index in-order
+        let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
+        for (name, index) in &self.auxiliary {
+            let index = index.try_read()?;
+            auxiliary.insert(name.clone(), index);
+
+            #[cfg(feature = "logging")]
+            log::trace!("locked index {name} for reading");
+        }
+
+        Ok(Table {
+            schema,
+            primary,
+            auxiliary,
+        })
+    }
+
     /// Lock this [`Table`] for writing.
     pub async fn write(&self) -> TableWriteGuard<S, S::Index, C, FE> {
+        #[cfg(feature = "logging")]
+        log::debug!("locking table for writing...");
+
         let schema = self.schema.clone();
 
         // lock the primary key first, separately from the indices, to avoid a deadlock
         let primary = self.primary.write().await;
+
+        #[cfg(feature = "logging")]
+        log::trace!("locked primary index for writing");
 
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in &self.auxiliary {
             let index = index.write().await;
             auxiliary.insert(name.clone(), index);
+
+            #[cfg(feature = "logging")]
+            log::trace!("locked index {name} for writing");
         }
 
         Table {
@@ -222,15 +278,25 @@ where
 
     /// Lock this [`Table`] for writing, without borrowing.
     pub async fn into_write(self) -> TableWriteGuard<S, S::Index, C, FE> {
+        #[cfg(feature = "logging")]
+        log::debug!("locking table for reading...");
+
         let schema = self.schema.clone();
 
         // lock the primary key first, separately from the indices, to avoid a deadlock
         let primary = self.primary.into_write().await;
 
+        #[cfg(feature = "logging")]
+        log::trace!("locked primary index for writing");
+
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in self.auxiliary {
             let index = index.into_write().await;
+
+            #[cfg(feature = "logging")]
+            log::trace!("locked index {name} for writing");
+
             auxiliary.insert(name, index);
         }
 
@@ -239,6 +305,36 @@ where
             primary,
             auxiliary,
         }
+    }
+
+    /// Lock this [`Table`] for writing synchronously, if possible.
+    pub fn try_write(&self) -> Result<TableWriteGuard<S, S::Index, C, FE>, io::Error> {
+        #[cfg(feature = "logging")]
+        log::debug!("locking table for writing...");
+
+        let schema = self.schema.clone();
+
+        // lock the primary key first, separately from the indices, to avoid a deadlock
+        let primary = self.primary.try_write()?;
+
+        #[cfg(feature = "logging")]
+        log::trace!("locked primary index for writing");
+
+        // then lock each index in-order
+        let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
+        for (name, index) in &self.auxiliary {
+            let index = index.try_write()?;
+            auxiliary.insert(name.clone(), index);
+
+            #[cfg(feature = "logging")]
+            log::trace!("locked index {name} for writing");
+        }
+
+        Ok(Table {
+            schema,
+            primary,
+            auxiliary,
+        })
     }
 }
 
@@ -818,6 +914,9 @@ where
 
     /// Delete all rows from this [`Table`].
     pub async fn truncate(&mut self) -> Result<(), io::Error> {
+        #[cfg(feature = "logging")]
+        log::debug!("Table::truncate");
+
         let mut truncates = Vec::with_capacity(self.auxiliary.len() + 1);
         truncates.push(self.primary.truncate());
 

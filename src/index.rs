@@ -55,6 +55,9 @@ where
     FE: Send + Sync,
 {
     pub async fn into_read(self) -> IndexReadGuard<S, C, FE> {
+        #[cfg(feature = "logging")]
+        log::debug!("lock B+Tree for reading");
+
         self.btree
             .into_read()
             .map(|btree| IndexReadGuard { btree })
@@ -62,13 +65,26 @@ where
     }
 
     pub async fn read(&self) -> IndexReadGuard<S, C, FE> {
+        #[cfg(feature = "logging")]
+        log::debug!("lock B+Tree for reading");
+
         self.btree
             .read()
             .map(|btree| IndexReadGuard { btree })
             .await
     }
 
+    pub fn try_read(&self) -> Result<IndexReadGuard<S, C, FE>, io::Error> {
+        #[cfg(feature = "logging")]
+        log::debug!("lock B+Tree for reading");
+
+        self.btree.try_read().map(|btree| IndexReadGuard { btree })
+    }
+
     pub async fn into_write(self) -> IndexWriteGuard<S, C, FE> {
+        #[cfg(feature = "logging")]
+        log::debug!("lock B+Tree for writing");
+
         self.btree
             .into_write()
             .map(|btree| IndexWriteGuard { btree })
@@ -76,10 +92,22 @@ where
     }
 
     pub async fn write(&self) -> IndexWriteGuard<S, C, FE> {
+        #[cfg(feature = "logging")]
+        log::debug!("lock B+Tree for writing");
+
         self.btree
             .write()
             .map(|btree| IndexWriteGuard { btree })
             .await
+    }
+
+    pub fn try_write(&self) -> Result<IndexWriteGuard<S, C, FE>, io::Error> {
+        #[cfg(feature = "logging")]
+        log::debug!("lock B+Tree for writing");
+
+        self.btree
+            .try_write()
+            .map(|btree| IndexWriteGuard { btree })
     }
 }
 
