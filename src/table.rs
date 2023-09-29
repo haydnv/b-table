@@ -358,6 +358,21 @@ where
     }
 }
 
+impl<S, C, G> Table<S, S::Index, C, G>
+where
+    S: Schema,
+{
+    fn get_index<'a, Id>(&'a self, index_id: Id) -> Option<&'a Index<S::Index, C, G>>
+    where
+        IndexId<'a>: From<Id>,
+    {
+        match index_id.into() {
+            IndexId::Primary => Some(&self.primary),
+            IndexId::Auxiliary(index_id) => self.auxiliary.get(index_id),
+        }
+    }
+}
+
 impl<S, C, FE, G> Table<S, S::Index, C, G>
 where
     S: Schema,
@@ -378,24 +393,31 @@ where
         range: Range<S::Id, S::Value>,
     ) -> Result<Option<Vec<S::Value>>, io::Error> {
         let plan = self.schema.plan_query(&[], &range)?;
-        self.first_inner(&plan.to_vec(), range).await
+        let indices = plan
+            .indices
+            .into_iter()
+            .map(|index_id| index_id.to_name())
+            .collect::<Vec<_>>();
+
+        self.first_inner(&indices, range).await
     }
 
     async fn first_inner<'a>(
         &'a self,
-        plan: &'a [String],
+        plan: &'a [Option<String>],
         range: Range<S::Id, S::Value>,
     ) -> Result<Option<Vec<S::Value>>, io::Error> {
-        let mut plan = plan.iter();
+        let mut plan = plan.into_iter();
         let mut range = range.into_inner();
 
         if let Some(index_id) = plan.next() {
-            let index = self.auxiliary.get(index_id.as_str()).expect("index");
+            let index = self.get_index(index_id).expect("index");
+
             let mut columns = index.schema().columns();
             let index_range = index_range_for(columns, &mut range);
             if let Some(mut first) = index.first(&index_range).await? {
                 while let Some(index_id) = plan.next() {
-                    let index = self.auxiliary.get(index_id.as_str()).expect("index");
+                    let index = self.get_index(index_id).expect("index");
                     let extractor = prefix_extractor(columns, index.schema().columns());
                     let prefix = extractor(first);
                     columns = &index.schema().columns()[..prefix.len()];
@@ -470,6 +492,7 @@ where
             while let Some(_row) = rows.try_next().await? {
                 count += 1;
             }
+
             Ok(count)
         }
     }
@@ -525,7 +548,7 @@ where
         //     reset the local column selection
 
         if let Some(index_id) = plan.indices.pop_front() {
-            let index = self.auxiliary.get(index_id).expect("index");
+            let index = self.get_index(index_id).expect("index");
             let index_order = index
                 .schema()
                 .columns()
@@ -550,7 +573,7 @@ where
         }
 
         while let Some(index_id) = plan.indices.pop_front() {
-            let index = self.auxiliary.get(index_id).expect("index");
+            let index = self.get_index(index_id).expect("index");
             let keys = local_keys.take().expect("keys");
             let columns = local_columns.expect("local columns");
 
@@ -588,8 +611,7 @@ where
             log::trace!("read from {index:?}");
 
             local_columns = self
-                .auxiliary
-                .get(index_id)
+                .get_index(index_id)
                 .map(|index| index.schema().columns());
 
             global_order = &global_order[index_order..];
@@ -800,11 +822,17 @@ where
         #[cfg(feature = "logging")]
         log::debug!("Table::delete_range");
 
+        let plan = self.schema.plan_query(&[], &range)?;
+        let indices = plan
+            .indices
+            .into_iter()
+            .map(|index_id| index_id.to_name())
+            .collect::<Vec<_>>();
+
         let key_len = self.schema.key().len();
-        let plan = self.schema.plan_query(&[], &range)?.to_vec();
 
         let mut deleted = 0;
-        while let Some(row) = self.first_inner(&plan, range.clone()).await? {
+        while let Some(row) = self.first_inner(&indices, range.clone()).await? {
             let key = row[..key_len].to_vec();
             self.delete_row(key).await?;
             deleted += 1;

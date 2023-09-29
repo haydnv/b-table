@@ -2,16 +2,69 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::ops::Bound;
-use std::{fmt, io};
+use std::{fmt, io, iter};
 
 use b_tree::collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
 
 pub use b_tree::{Key, Schema as BTreeSchema};
 
+/// An ID type used to look up a specific table index
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+pub enum IndexId<'a> {
+    Primary,
+    Auxiliary(&'a str),
+}
+
+impl<'a> Default for IndexId<'a> {
+    fn default() -> Self {
+        Self::Primary
+    }
+}
+
+impl<'a> IndexId<'a> {
+    /// Return the name of this index as a [`String`], if this is a named auxiliary index.
+    pub fn to_name(&self) -> Option<String> {
+        match self {
+            Self::Primary => None,
+            Self::Auxiliary(index_id) => Some(index_id.to_string()),
+        }
+    }
+}
+
+impl<'a> From<&'a str> for IndexId<'a> {
+    fn from(id: &'a str) -> Self {
+        Self::Auxiliary(id)
+    }
+}
+
+impl<'a> From<&'a String> for IndexId<'a> {
+    fn from(id: &'a String) -> Self {
+        Self::Auxiliary(id)
+    }
+}
+
+impl<'a> From<&'a Option<String>> for IndexId<'a> {
+    fn from(id: &'a Option<String>) -> Self {
+        match id {
+            None => Self::Primary,
+            Some(index_id) => Self::Auxiliary(index_id),
+        }
+    }
+}
+
+impl<'a> fmt::Debug for IndexId<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Primary => f.write_str("primary"),
+            Self::Auxiliary(id) => write!(f, "{}", id),
+        }
+    }
+}
+
 #[derive(Eq, PartialEq)]
 pub struct QueryPlan<'a, S> {
     schema: &'a S,
-    pub indices: VecDeque<&'a str>,
+    pub indices: VecDeque<IndexId<'a>>,
 }
 
 impl<'a, S> Clone for QueryPlan<'a, S> {
@@ -31,13 +84,18 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
         }
     }
 
-    fn with_index(
+    fn with_index<Id>(
         schema: &'a S,
         order: &[S::Id],
         range: &Range<S::Id, S::Value>,
-        index_id: &'a str,
-    ) -> Option<Self> {
+        index_id: Id,
+    ) -> Option<Self>
+    where
+        IndexId<'a>: From<Id>,
+    {
+        let index_id = index_id.into();
         let index = get_index(schema, index_id);
+
         if index.columns().is_empty() {
             None
         } else if order.is_empty() {
@@ -62,7 +120,7 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
         }
     }
 
-    fn clone_and_push(&self, index_id: &'a str) -> Self {
+    fn clone_and_push(&self, index_id: IndexId<'a>) -> Self {
         let mut clone = self.clone();
         clone.indices.push_back(index_id);
         clone
@@ -118,10 +176,6 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
         (covered_order, covered_range)
     }
 
-    pub fn to_vec(&self) -> Vec<String> {
-        self.indices.iter().map(|s| (*s).to_owned()).collect()
-    }
-
     fn is_complete(&self, order: &[S::Id], range: &Range<S::Id, S::Value>) -> bool {
         let (covered_order, covered_range) = self.covers(order, range);
         debug_assert!(covered_order <= order.len());
@@ -129,11 +183,14 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
         covered_order == order.len() && covered_range.len() == range.len()
     }
 
-    fn needs(&self, order: &[S::Id], range: &Range<S::Id, S::Value>, index_id: &str) -> bool {
+    fn needs<Id>(&self, order: &[S::Id], range: &Range<S::Id, S::Value>, index_id: Id) -> bool
+    where
+        IndexId<'a>: From<Id>,
+    {
         let (covered_order, covered_range) = self.covers(order, range);
         debug_assert!(covered_order <= order.len());
 
-        let index_columns = get_index(self.schema, index_id).columns();
+        let index_columns = get_index(self.schema, index_id.into()).columns();
         assert!(!index_columns.is_empty());
 
         if covered_order < order.len() {
@@ -144,24 +201,34 @@ impl<'a, S: Schema> QueryPlan<'a, S> {
         }
     }
 
-    fn supports(&self, index_id: &str) -> bool {
-        let available_columns = self
-            .indices
-            .iter()
-            .last()
-            .copied()
-            .map(|index_id| get_index(self.schema, index_id).columns())
-            .unwrap_or_default();
-
-        let index_columns = get_index(self.schema, index_id).columns();
-
-        if available_columns.is_empty() {
+    fn supports<Id>(&'a self, index_id: Id) -> bool
+    where
+        IndexId<'a>: From<Id>,
+    {
+        if self.indices.is_empty() {
             true
-        } else if index_columns.is_empty() {
-            false
         } else {
-            available_columns.contains(&index_columns[0])
+            let column_name = &get_index(self.schema, index_id.into()).columns()[0];
+
+            for index_id in &self.indices {
+                let index = get_index(self.schema, *index_id);
+                if index.columns().contains(column_name) {
+                    return true;
+                }
+            }
+
+            false
         }
+    }
+}
+
+impl<'a, S: fmt::Debug> fmt::Debug for QueryPlan<'a, S> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "plan to query indices {:?} of {:?}",
+            self.indices, self.schema
+        )
     }
 }
 
@@ -262,35 +329,38 @@ pub trait Schema: Eq + Sized + fmt::Debug {
 
         for (name, _index) in self.auxiliary() {
             if let Some(candidate) = QueryPlan::with_index(self, order, range, name) {
-                #[cfg(feature = "logging")]
-                log::trace!("index {name} supports {range:?} with order {order:?}");
-
                 if candidate.is_complete(order, range) {
                     return Ok(candidate);
                 } else {
                     candidates.push_back(candidate);
                 }
-            } else {
-                #[cfg(feature = "logging")]
-                log::trace!("index {name} does not support {range:?} with order {order:?}");
             }
         }
 
         while let Some(plan) = candidates.pop_front() {
-            for (name, _index) in self.auxiliary() {
-                if plan.supports(name) && plan.needs(order, range, name) {
-                    #[cfg(feature = "logging")]
-                    log::trace!("index {name} supports {range:?} with order {order:?}");
+            let indices = iter::once((IndexId::Primary, self.primary())).chain(
+                self.auxiliary()
+                    .iter()
+                    .map(|(name, index)| (IndexId::from(name), index)),
+            );
 
-                    let candidate = plan.clone_and_push(name);
-                    if candidate.is_complete(order, range) {
-                        return Ok(candidate);
+            for (name, _index) in indices {
+                if plan.supports(name) {
+                    if plan.needs(order, range, name) {
+                        let candidate = plan.clone_and_push(name);
+
+                        if candidate.is_complete(order, range) {
+                            return Ok(candidate);
+                        } else {
+                            candidates.push_back(candidate);
+                        }
                     } else {
-                        candidates.push_back(candidate);
+                        #[cfg(feature = "logging")]
+                        log::trace!("{plan:?} does not need index {name:?}");
                     }
                 } else {
                     #[cfg(feature = "logging")]
-                    log::trace!("index {name} does not {range:?} with order {order:?}");
+                    log::trace!("{plan:?} does not support index {name:?}");
                 }
             }
         }
@@ -517,11 +587,14 @@ where
     }
 }
 
-fn get_index<'a, S: Schema>(schema: &'a S, index_id: &'a str) -> &'a S::Index {
-    schema
-        .auxiliary()
-        .iter()
-        .filter_map(|(name, index)| if name == index_id { Some(index) } else { None })
-        .next()
-        .expect("index")
+fn get_index<'a, S: Schema>(schema: &'a S, index_id: IndexId<'a>) -> &'a S::Index {
+    match index_id.into() {
+        IndexId::Primary => schema.primary(),
+        IndexId::Auxiliary(index_id) => schema
+            .auxiliary()
+            .iter()
+            .filter_map(|(name, index)| if name == index_id { Some(index) } else { None })
+            .next()
+            .expect("index"),
+    }
 }

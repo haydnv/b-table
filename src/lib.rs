@@ -9,5 +9,5 @@ mod schema;
 mod stream;
 mod table;
 
-/// A node in an [`Table`] index
+/// A node in a [`Table`] index
 pub type Node<V> = b_tree::Node<Vec<Key<V>>>;

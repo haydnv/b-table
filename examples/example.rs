@@ -240,6 +240,7 @@ async fn main() -> Result<(), io::Error> {
     // create the table
     let table = TableLock::create(schema, Collator::new(), dir)?;
 
+    // test reading from an empty table
     {
         let guard = table.read().await;
         let range = Range::default();
@@ -254,6 +255,7 @@ async fn main() -> Result<(), io::Error> {
     }
 
     {
+        // test inserting a row
         {
             let mut guard = table.write().await;
 
@@ -264,6 +266,7 @@ async fn main() -> Result<(), io::Error> {
             assert!(!guard.upsert(key, values).await?);
         }
 
+        // test reading a row
         {
             let guard = table.read().await;
             assert_eq!(guard.count(Default::default()).await?, 1);
@@ -289,12 +292,14 @@ async fn main() -> Result<(), io::Error> {
         let key = row2[..1].to_vec();
         let values = row2[1..].to_vec();
 
+        // test inserting a second row
         {
             let mut guard = table.write().await;
             assert!(guard.upsert(key.clone(), values.clone()).await?);
             assert!(!guard.upsert(key, values).await?);
         }
 
+        // test reading a range
         {
             let guard = table.read().await;
 
@@ -324,6 +329,7 @@ async fn main() -> Result<(), io::Error> {
         }
     }
 
+    // test reading a stream of all rows
     {
         let guard = table.read().await;
         let mut stream = guard.rows(Range::default(), &[], false, None)?;
@@ -333,7 +339,7 @@ async fn main() -> Result<(), io::Error> {
         assert_eq!(stream.try_next().await?, None);
 
         let range = Range::from_iter([(
-            "down".to_string().into(),
+            "down".to_string(),
             (Bound::Unbounded, Bound::Excluded(10.into())),
         )]);
 
@@ -343,6 +349,7 @@ async fn main() -> Result<(), io::Error> {
         assert_eq!(stream.try_next().await?, None);
     }
 
+    // test deleting a row
     {
         table.write().await.delete_row(vec![1.into()]).await?;
 
@@ -354,6 +361,7 @@ async fn main() -> Result<(), io::Error> {
         assert!(guard.is_empty(range).await?);
     }
 
+    // test deleting the last row
     {
         table.write().await.delete_row(vec![2.into()]).await?;
 
@@ -366,5 +374,6 @@ async fn main() -> Result<(), io::Error> {
         assert!(guard.is_empty(range).await?);
     }
 
+    // clean up
     fs::remove_dir_all(path).await
 }
