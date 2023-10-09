@@ -7,8 +7,9 @@ use std::{fmt, io};
 use b_tree::collate::Collate;
 use b_tree::{BTree, BTreeLock};
 use freqfs::{DirDeref, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
-use futures::future::{try_join_all, TryFutureExt};
-use futures::stream::{Stream, StreamExt, TryStreamExt};
+use futures::future::{Future, TryFutureExt};
+use futures::stream::{Stream, TryStreamExt};
+use futures::try_join;
 use safecast::AsType;
 use smallvec::SmallVec;
 
@@ -16,6 +17,9 @@ use super::schema::*;
 use super::Node;
 
 const PRIMARY: &str = "primary";
+const INDEX_STACK_SIZE: usize = 16;
+
+type IndexStack<T> = SmallVec<[T; INDEX_STACK_SIZE]>;
 
 /// A read guard acquired on a [`TableLock`]
 pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, Arc<DirReadGuardOwned<FE>>>;
@@ -517,7 +521,7 @@ fn index_range_for<K: Eq + Hash, V>(
     columns: &[K],
     range: &mut HashMap<K, ColumnRange<V>>,
 ) -> b_tree::Range<V> {
-    let mut prefix = Vec::with_capacity(range.len());
+    let mut prefix = Key::with_capacity(range.len());
 
     for col_name in columns {
         if let Some(col_range) = range.remove(col_name) {
@@ -536,7 +540,7 @@ fn index_range_for<K: Eq + Hash, V>(
 }
 
 #[inline]
-fn inner_range<V>(mut prefix: Vec<V>, column_range: Option<ColumnRange<V>>) -> b_tree::Range<V> {
+fn inner_range<V>(mut prefix: Key<V>, column_range: Option<ColumnRange<V>>) -> b_tree::Range<V> {
     if let Some(column_range) = column_range {
         match column_range {
             ColumnRange::Eq(value) => {
@@ -553,7 +557,7 @@ fn inner_range<V>(mut prefix: Vec<V>, column_range: Option<ColumnRange<V>>) -> b
 fn prefix_extractor<K, V>(
     columns_in: &[K],
     columns_out: &[K],
-) -> Box<dyn Fn(Vec<V>) -> Vec<V> + Send>
+) -> Box<dyn Fn(Key<V>) -> Key<V> + Send>
 where
     K: PartialEq + fmt::Debug,
 {
@@ -570,7 +574,7 @@ where
         return Box::new(|key| key);
     }
 
-    let mut indices = Vec::with_capacity(columns_out.len());
+    let mut indices = IndexStack::with_capacity(columns_out.len());
 
     for name_out in columns_out
         .iter()
@@ -587,7 +591,7 @@ where
     }
 
     Box::new(move |mut key| {
-        let mut prefix = Vec::with_capacity(indices.len() + 1);
+        let mut prefix = Key::with_capacity(indices.len() + 1);
 
         for i in indices.iter().copied() {
             prefix.push(key.remove(i));
@@ -629,7 +633,7 @@ where
             return Ok(false);
         };
 
-        let mut deletes = SmallVec::<[_; 16]>::with_capacity(self.auxiliary.len() + 1);
+        let mut deletes = IndexStack::with_capacity(self.auxiliary.len() + 1);
 
         for (name, index) in self.auxiliary.iter_mut() {
             deletes.push(async {
@@ -675,7 +679,7 @@ where
             .into());
         }
 
-        let mut deletes = SmallVec::<[_; 16]>::with_capacity(self.auxiliary.len() + 1);
+        let mut deletes = IndexStack::with_capacity(self.auxiliary.len() + 1);
 
         deletes.push(self.primary.delete_all(other.primary));
 
@@ -710,7 +714,7 @@ where
             .into());
         }
 
-        let mut merges = SmallVec::<[_; 16]>::with_capacity(self.auxiliary.len() + 1);
+        let mut merges = IndexStack::with_capacity(self.auxiliary.len() + 1);
 
         merges.push(self.primary.merge(other.primary));
 
@@ -737,7 +741,7 @@ where
         let mut row = key;
         row.extend(values);
 
-        let mut inserts = SmallVec::<[_; 16]>::with_capacity(self.auxiliary.len() + 1);
+        let mut inserts = IndexStack::with_capacity(self.auxiliary.len() + 1);
 
         for (name, index) in self.auxiliary.iter_mut() {
             let index_key = self.schema.extract_key(name, &row);
@@ -760,7 +764,7 @@ where
         #[cfg(feature = "logging")]
         log::debug!("Table::truncate");
 
-        let mut truncates = SmallVec::<[_; 16]>::with_capacity(self.auxiliary.len() + 1);
+        let mut truncates = IndexStack::with_capacity(self.auxiliary.len() + 1);
         truncates.push(self.primary.truncate());
 
         for index in self.auxiliary.values_mut() {
@@ -768,6 +772,7 @@ where
         }
 
         try_join_all(truncates).await?;
+
         Ok(())
     }
 }
@@ -778,4 +783,23 @@ fn bad_key<V: fmt::Debug>(key: &[V], key_len: usize) -> io::Error {
         io::ErrorKind::InvalidInput,
         format!("invalid key: {key:?}, expected exactly {key_len} column(s)",),
     )
+}
+
+#[inline]
+fn try_join_all<'a, O, F>(
+    mut futures: IndexStack<F>,
+) -> Pin<Box<dyn Future<Output = Result<IndexStack<O>, io::Error>> + 'a>>
+where
+    O: 'a,
+    F: Future<Output = Result<O, io::Error>> + 'a,
+{
+    Box::pin(async move {
+        if let Some(fut) = futures.pop() {
+            let (out, mut others) = try_join!(fut, try_join_all(futures))?;
+            others.push(out);
+            Ok(others)
+        } else {
+            Ok(IndexStack::new())
+        }
+    })
 }

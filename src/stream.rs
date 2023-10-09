@@ -18,7 +18,7 @@ impl<S, IS, C, FE> de::Visitor for TableVisitor<S, IS, C, FE>
 where
     S: Schema<Index = IS> + Send + Sync + fmt::Debug,
     IS: b_tree::Schema + Send + Sync,
-    C: Collate<Value = S::Value> + Send + Sync + 'static,
+    C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static,
     S::Value: de::FromStream<Context = ()>,
     Node<S::Value>: FileLoad + fmt::Debug,
