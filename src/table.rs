@@ -4,13 +4,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::{fmt, io};
 
+use b_tree::collate::Collate;
+use b_tree::{BTree, BTreeLock};
 use freqfs::{DirDeref, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
 use futures::future::{try_join_all, TryFutureExt};
 use futures::stream::{Stream, StreamExt, TryStreamExt};
 use safecast::AsType;
+use smallvec::SmallVec;
 
-use super::index::collate::Collate;
-use super::index::{self, Index, IndexLock, Key};
 use super::schema::*;
 use super::Node;
 
@@ -23,17 +24,21 @@ pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, Arc<DirReadGuardOwned<FE
 pub type TableWriteGuard<S, IS, C, FE> = Table<S, IS, C, DirWriteGuardOwned<FE>>;
 
 /// A stream of table rows
-pub type Rows<V> = Pin<Box<dyn Stream<Item = Result<Vec<V>, io::Error>> + Send>>;
+pub type Rows<V> = Pin<Box<dyn Stream<Item = Result<Key<V>, io::Error>> + Send>>;
 
 /// A futures-aware read-write lock on a [`Table`]
 pub struct TableLock<S, IS, C, FE> {
-    schema: Arc<S>,
+    schema: Arc<TableSchema<S>>,
     dir: DirLock<FE>,
-    primary: IndexLock<IS, C, FE>,
-    auxiliary: BTreeMap<String, IndexLock<IS, C, FE>>,
+    primary: BTreeLock<IS, C, FE>,
+    // use a BTreeMap to make sure index locks are always acquired in-order
+    auxiliary: BTreeMap<String, BTreeLock<IS, C, FE>>,
 }
 
-impl<S, IS, C, FE> Clone for TableLock<S, IS, C, FE> {
+impl<S, IS, C, FE> Clone for TableLock<S, IS, C, FE>
+where
+    C: Clone,
+{
     fn clone(&self) -> Self {
         Self {
             schema: self.schema.clone(),
@@ -47,11 +52,11 @@ impl<S, IS, C, FE> Clone for TableLock<S, IS, C, FE> {
 impl<S, IS, C, FE> TableLock<S, IS, C, FE> {
     /// Borrow the [`Schema`] of this [`Table`].
     pub fn schema(&self) -> &S {
-        &self.schema
+        self.schema.inner()
     }
 
     /// Borrow the collator for this [`Table`].
-    pub fn collator(&self) -> &Arc<index::Collator<C>> {
+    pub fn collator(&self) -> &b_tree::Collator<C> {
         self.primary.collator()
     }
 }
@@ -80,14 +85,14 @@ where
 
         let primary = {
             let dir = dir_contents.create_dir(PRIMARY.to_string())?;
-            IndexLock::create(schema.primary().clone(), collator.clone(), dir)
+            BTreeLock::create(schema.primary().clone(), collator.clone(), dir)
         }?;
 
         let mut auxiliary = BTreeMap::new();
         for (name, schema) in schema.auxiliary() {
             let index = {
                 let dir = dir_contents.create_dir(name.to_string())?;
-                IndexLock::create(schema.clone(), collator.clone(), dir)
+                BTreeLock::create(schema.clone(), collator.clone(), dir)
             }?;
 
             auxiliary.insert(name.clone(), index);
@@ -96,7 +101,7 @@ where
         std::mem::drop(dir_contents);
 
         Ok(Self {
-            schema: Arc::new(schema),
+            schema: Arc::new(schema.into()),
             primary,
             auxiliary,
             dir,
@@ -120,14 +125,14 @@ where
 
         let primary = {
             let dir = dir_contents.get_or_create_dir(PRIMARY.to_string())?;
-            IndexLock::load(schema.primary().clone(), collator.clone(), dir.clone())
+            BTreeLock::load(schema.primary().clone(), collator.clone(), dir.clone())
         }?;
 
         let mut auxiliary = BTreeMap::new();
         for (name, schema) in schema.auxiliary() {
             let index = {
                 let dir = dir_contents.get_or_create_dir(name.clone())?;
-                IndexLock::load(schema.clone(), collator.clone(), dir.clone())
+                BTreeLock::load(schema.clone(), collator.clone(), dir.clone())
             }?;
 
             auxiliary.insert(name.clone(), index);
@@ -136,7 +141,7 @@ where
         std::mem::drop(dir_contents);
 
         Ok(Self {
-            schema: Arc::new(schema),
+            schema: Arc::new(schema.into()),
             primary,
             auxiliary,
             dir,
@@ -151,8 +156,11 @@ where
     }
 }
 
-impl<S: Schema, C, FE: Send + Sync> TableLock<S, S::Index, C, FE>
+impl<S, C, FE> TableLock<S, S::Index, C, FE>
 where
+    S: Schema,
+    C: Clone,
+    FE: Send + Sync,
     Node<S::Value>: FileLoad,
 {
     /// Lock this [`Table`] for reading.
@@ -231,7 +239,7 @@ where
 
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
-        for (name, index) in &self.auxiliary {
+        for (name, index) in self.auxiliary.iter() {
             let index = index.try_read()?;
             auxiliary.insert(name.clone(), index);
 
@@ -261,7 +269,7 @@ where
 
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
-        for (name, index) in &self.auxiliary {
+        for (name, index) in self.auxiliary.iter() {
             let index = index.write().await;
             auxiliary.insert(name.clone(), index);
 
@@ -291,7 +299,7 @@ where
 
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
-        for (name, index) in self.auxiliary {
+        for (name, index) in self.auxiliary.into_iter() {
             let index = index.into_write().await;
 
             #[cfg(feature = "logging")]
@@ -322,7 +330,7 @@ where
 
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
-        for (name, index) in &self.auxiliary {
+        for (name, index) in self.auxiliary.iter() {
             let index = index.try_write()?;
             auxiliary.insert(name.clone(), index);
 
@@ -340,13 +348,14 @@ where
 
 /// A database table with support for multiple indices
 pub struct Table<S, IS, C, G> {
-    schema: Arc<S>,
-    primary: Index<IS, C, G>,
-    auxiliary: HashMap<String, Index<IS, C, G>>, // TODO: should this be in an Arc?
+    schema: Arc<TableSchema<S>>,
+    primary: BTree<IS, C, G>,
+    auxiliary: HashMap<String, BTree<IS, C, G>>,
 }
 
 impl<S, IS, C, G> Clone for Table<S, IS, C, G>
 where
+    C: Clone,
     G: Clone,
 {
     fn clone(&self) -> Self {
@@ -362,7 +371,8 @@ impl<S, C, G> Table<S, S::Index, C, G>
 where
     S: Schema,
 {
-    fn get_index<'a, Id>(&'a self, index_id: Id) -> Option<&'a Index<S::Index, C, G>>
+    #[inline]
+    fn get_index<'a, Id>(&'a self, index_id: Id) -> Option<&'a BTree<S::Index, C, G>>
     where
         IndexId<'a>: From<Id>,
     {
@@ -383,98 +393,70 @@ where
     Range<S::Id, S::Value>: fmt::Debug,
 {
     /// Return `true` if the given `key` is present in this [`Table`].
-    pub async fn contains(&self, key: &Key<S::Value>) -> Result<bool, io::Error> {
-        self.primary.contains(key).await
+    pub async fn contains(&self, key: &[S::Value]) -> Result<bool, io::Error> {
+        let key_len = self.schema.key().len();
+
+        if key.len() == key_len {
+            self.primary.contains(key).await
+        } else {
+            Err(bad_key(key, key_len))
+        }
     }
 
     /// Return the first row in the given `range`, if any.
     pub async fn first(
         &self,
         range: Range<S::Id, S::Value>,
-    ) -> Result<Option<Vec<S::Value>>, io::Error> {
-        let plan = self.schema.plan_query(&[], &range)?;
-        let indices = plan
-            .indices
-            .into_iter()
-            .map(|index_id| index_id.to_name())
-            .collect::<Vec<_>>();
-
-        self.first_inner(&indices, range).await
+    ) -> Result<Option<Key<S::Value>>, io::Error> {
+        todo!()
     }
 
     async fn first_inner<'a>(
         &'a self,
         plan: &'a [Option<String>],
         range: Range<S::Id, S::Value>,
-    ) -> Result<Option<Vec<S::Value>>, io::Error> {
-        let mut plan = plan.into_iter();
-        let mut range = range.into_inner();
-
-        if let Some(index_id) = plan.next() {
-            let index = self.get_index(index_id).expect("index");
-
-            let mut columns = index.schema().columns();
-            let index_range = index_range_for(columns, &mut range);
-            if let Some(mut first) = index.first(&index_range).await? {
-                while let Some(index_id) = plan.next() {
-                    let index = self.get_index(index_id).expect("index");
-                    let extractor = prefix_extractor(columns, index.schema().columns());
-                    let prefix = extractor(first);
-                    columns = &index.schema().columns()[..prefix.len()];
-
-                    let column_range = columns.get(prefix.len()).and_then(|col| range.remove(col));
-                    let index_range = inner_range(prefix, column_range);
-
-                    if let Some(row) = index.first(&index_range).await? {
-                        first = row;
-                    } else {
-                        return Ok(None);
-                    }
-                }
-
-                range.extend(
-                    columns
-                        .iter()
-                        .cloned()
-                        .zip(first.into_iter().map(ColumnRange::Eq)),
-                );
-            } else {
-                return Ok(None);
-            }
-        };
-
-        let index_range = index_range_for(self.primary.schema().columns(), &mut range);
-        assert!(range.is_empty());
-        self.primary.first(&index_range).await
+    ) -> Result<Option<Key<S::Value>>, io::Error> {
+        todo!()
     }
 
     /// Look up a row by its `key`.
-    pub async fn get_row(&self, key: Key<S::Value>) -> Result<Option<Vec<S::Value>>, S::Error> {
-        let key = self.schema.validate_key(key)?;
+    pub async fn get_row<K: Into<Key<S::Value>>>(
+        &self,
+        key: K,
+    ) -> Result<Option<Key<S::Value>>, io::Error> {
+        let key = key.into();
+        let key_len = self.schema.key().len();
 
-        self.primary
-            .first(&b_tree::Range::from_prefix(key))
-            .map_err(S::Error::from)
-            .await
+        if key.len() == key_len {
+            self.primary.first(&b_tree::Range::from_prefix(key)).await
+        } else {
+            Err(bad_key(&key, key_len))
+        }
     }
 
     /// Look up a value by its `key`.
-    pub async fn get_value(&self, key: Key<S::Value>) -> Result<Option<Vec<S::Value>>, S::Error> {
-        let key = self.schema.validate_key(key)?;
+    pub async fn get_value<K: Into<Key<S::Value>>>(
+        &self,
+        key: K,
+    ) -> Result<Option<Key<S::Value>>, io::Error> {
+        let key = key.into();
         let key_len = self.schema.key().len();
 
-        self.primary
-            .first(&b_tree::Range::from_prefix(key))
-            .map_ok(|maybe_row| maybe_row.map(|mut row| row.drain(key_len..).collect()))
-            .map_err(S::Error::from)
-            .await
+        if key.len() == key_len {
+            self.primary
+                .first(&b_tree::Range::from_prefix(key))
+                .map_ok(|maybe_row| maybe_row.map(|mut row| row.drain(key_len..).collect()))
+                .await
+        } else {
+            Err(bad_key(&key, key_len))
+        }
     }
 }
 
 impl<S, C, FE, G> Table<S, S::Index, C, G>
 where
     S: Schema,
-    C: Collate<Value = S::Value> + Send + Sync + 'static,
+    C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static,
     G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
     Node<S::Value>: FileLoad,
@@ -483,7 +465,7 @@ where
     /// Count how many rows in this [`Table`] lie within the given `range`.
     pub async fn count(&self, range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
         if range.is_default() {
-            self.primary.count(&index::Range::default()).await
+            self.primary.count(&b_tree::Range::default()).await
         } else {
             // TODO: optimize
             let mut rows = self.rows(range, &[], false, None)?;
@@ -500,7 +482,7 @@ where
     /// Return `true` if the given [`Range`] of this [`Table`] does not contain any rows.
     pub async fn is_empty(&self, range: Range<S::Id, S::Value>) -> Result<bool, io::Error> {
         if range.is_default() {
-            self.primary.is_empty(&index::Range::default()).await
+            self.primary.is_empty(&b_tree::Range::default()).await
         } else {
             let mut rows = self.rows(range, &[], false, None)?;
             rows.try_next()
@@ -509,176 +491,24 @@ where
         }
     }
 
-    // TODO: can this be broken up into smaller methods, or a helper data structure?
     /// Construct a [`Stream`] of the values of the `selected` columns within the given `range`.
     pub fn rows(
         &self,
         range: Range<S::Id, S::Value>,
         order: &[S::Id],
         reverse: bool,
-        selected: Option<&[S::Id]>,
+        select: Option<&[S::Id]>,
     ) -> Result<Rows<S::Value>, io::Error> {
         #[cfg(feature = "logging")]
         log::debug!("Table::rows with order {order:?}");
 
-        let mut plan = self.schema.plan_query(order, &range)?;
-
-        let global_columns = selected.unwrap_or_else(|| self.schema.primary().columns());
-
-        if global_columns.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "empty column selection",
-            ));
-        }
-
-        let mut global_order = order;
-        let mut global_range = range.into_inner();
-
-        let mut local_keys: Option<Rows<S::Value>> = None;
-        let mut local_columns: Option<&[S::Id]> = None;
-
-        // for each index in the plan:
-        //   construct the index order and range
-        //   if there are still global order and range constraints unhandled:
-        //     (merge the previous index and) group the index by the order+range columns
-        //     reset the local column selection
-        //   else:
-        //     (merge the previous index and) select the keys from the index
-        //     reset the local column selection
-
-        if let Some(index_id) = plan.indices.pop_front() {
-            let index = self.get_index(index_id).expect("index");
-            let index_order = index
-                .schema()
-                .columns()
-                .iter()
-                .zip(global_order)
-                .take_while(|(ic, oc)| ic == oc)
-                .count();
-
-            debug_assert!(index
-                .schema()
-                .columns()
-                .starts_with(&global_order[..index_order]));
-
-            let index_range = index_range_for(index.schema().columns(), &mut global_range);
-
-            #[cfg(feature = "logging")]
-            log::trace!("read from {index:?}");
-
-            local_keys = Some(Box::pin(index.clone().keys(index_range, reverse)));
-            local_columns = Some(index.schema().columns());
-            global_order = &global_order[index_order..];
-        }
-
-        while let Some(index_id) = plan.indices.pop_front() {
-            let index = self.get_index(index_id).expect("index");
-            let keys = local_keys.take().expect("keys");
-            let columns = local_columns.expect("local columns");
-
-            #[cfg(feature = "logging")]
-            log::trace!("merge ordered selection {columns:?} with {index:?}");
-
-            let column_range = if columns.len() < index.schema().columns().len() {
-                columns.last().and_then(|col| global_range.remove(col))
-            } else {
-                None
-            };
-
-            let index_columns = index.schema().columns();
-            let index_order = index_columns
-                .iter()
-                .zip(global_order)
-                .take_while(|(ic, oc)| ic == oc)
-                .count();
-
-            debug_assert_eq!(index_columns[..index_order], global_order[..index_order]);
-
-            let prefix_len = index_columns
-                .iter()
-                .take_while(|id| columns.contains(id))
-                .count();
-
-            debug_assert!(prefix_len > 0);
-
-            let extract_prefix = prefix_extractor(columns, &index_columns[..prefix_len]);
-            let index = index.clone();
-            let merge_source =
-                keys.map_ok(move |key| inner_range(extract_prefix(key), column_range.clone()));
-
-            #[cfg(feature = "logging")]
-            log::trace!("read from {index:?}");
-
-            local_columns = self
-                .get_index(index_id)
-                .map(|index| index.schema().columns());
-
-            global_order = &global_order[index_order..];
-
-            let keys = merge_source
-                .map(move |result| result.map(|range| index.clone().keys(range, reverse)))
-                .try_flatten();
-
-            local_keys = Some(Box::pin(keys));
-        }
-
-        // if the local column selection includes the global column selection:
-        //   return the index key stream with the global column selection
-        // else:
-        //   for each selected key in the index, construct a range of the primary index
-        //   select a stream of that range
-        //   flatten the streams
-
-        if let Some(local_columns) = local_columns {
-            let local_keys = local_keys.expect("keys");
-
-            let selected_columns_present = global_columns
-                .iter()
-                .all(|col_name| local_columns.contains(col_name));
-
-            if selected_columns_present {
-                let extract_row = prefix_extractor(local_columns, global_columns);
-                let rows = local_keys.map_ok(extract_row);
-                Ok(Box::pin(rows))
-            } else {
-                assert!(self
-                    .schema
-                    .key()
-                    .iter()
-                    .all(|col_name| local_columns.contains(col_name)));
-
-                let extract_pk = prefix_extractor(local_columns, self.schema.key());
-                let primary = self.primary.clone();
-                let rows = local_keys
-                    .map_ok(extract_pk)
-                    .map(move |result| {
-                        // this clone is necessary in order run multiple concurrent lookups
-                        let primary = primary.clone();
-
-                        result.map(move |pk| async move {
-                            let pk = index::Range::from_prefix(pk);
-                            let row = primary.first(&pk).await?;
-                            Ok(row.expect("row"))
-                        })
-                    })
-                    .try_buffered(num_cpus::get());
-
-                Ok(Box::pin(rows))
-            }
-        } else {
-            assert!(self.primary.schema().columns().starts_with(global_order));
-            let range = index_range_for(self.primary.schema().columns(), &mut global_range);
-            assert!(global_range.is_empty());
-            let rows = self.primary.clone().keys(range, reverse);
-            Ok(Box::pin(rows))
-        }
+        todo!()
     }
 
     /// Consume this [`TableReadGuard`] to construct a [`Stream`] of all the rows in the [`Table`].
-    pub fn into_rows(self) -> Rows<S::Value> {
-        let rows = self.primary.keys(index::Range::default(), false);
-        Box::pin(rows)
+    pub async fn into_rows(self) -> Result<Rows<S::Value>, io::Error> {
+        let rows = self.primary.keys(b_tree::Range::default(), false).await?;
+        Ok(Box::pin(rows))
     }
 }
 
@@ -686,7 +516,7 @@ where
 fn index_range_for<K: Eq + Hash, V>(
     columns: &[K],
     range: &mut HashMap<K, ColumnRange<V>>,
-) -> index::Range<V> {
+) -> b_tree::Range<V> {
     let mut prefix = Vec::with_capacity(range.len());
 
     for col_name in columns {
@@ -696,27 +526,27 @@ fn index_range_for<K: Eq + Hash, V>(
                     prefix.push(value);
                 }
                 ColumnRange::In(bounds) => {
-                    return index::Range::with_bounds(prefix, bounds);
+                    return b_tree::Range::with_bounds(prefix, bounds);
                 }
             }
         }
     }
 
-    index::Range::from_prefix(prefix)
+    b_tree::Range::from_prefix(prefix)
 }
 
 #[inline]
-fn inner_range<V>(mut prefix: Vec<V>, column_range: Option<ColumnRange<V>>) -> index::Range<V> {
+fn inner_range<V>(mut prefix: Vec<V>, column_range: Option<ColumnRange<V>>) -> b_tree::Range<V> {
     if let Some(column_range) = column_range {
         match column_range {
             ColumnRange::Eq(value) => {
                 prefix.push(value);
-                index::Range::from_prefix(prefix)
+                b_tree::Range::from_prefix(prefix)
             }
-            ColumnRange::In(bounds) => index::Range::with_bounds(prefix, bounds),
+            ColumnRange::In(bounds) => b_tree::Range::with_bounds(prefix, bounds),
         }
     } else {
-        index::Range::from_prefix(prefix)
+        b_tree::Range::from_prefix(prefix)
     }
 }
 
@@ -785,7 +615,7 @@ impl<S, IS, C, FE> Table<S, IS, C, DirWriteGuardOwned<FE>> {
 impl<S, C, FE> Table<S, S::Index, C, DirWriteGuardOwned<FE>>
 where
     S: Schema + Send + Sync,
-    C: Collate<Value = S::Value> + Send + Sync + 'static,
+    C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
     FE: AsType<Node<S::Value>> + Send + Sync + 'static,
     <S as Schema>::Index: Send + Sync,
     Node<S::Value>: FileLoad,
@@ -799,12 +629,12 @@ where
             return Ok(false);
         };
 
-        let mut deletes = Vec::with_capacity(self.auxiliary.len() + 1);
+        let mut deletes = SmallVec::<[_; 16]>::with_capacity(self.auxiliary.len() + 1);
 
-        for index in self.auxiliary.values_mut() {
+        for (name, index) in self.auxiliary.iter_mut() {
             deletes.push(async {
-                let row = IndexSchema::extract_key(self.schema.primary(), &row, index.schema());
-                index.delete(&row).await
+                let index_key = self.schema.extract_key(name, &row);
+                index.delete(&index_key).await
             })
         }
 
@@ -822,23 +652,7 @@ where
         #[cfg(feature = "logging")]
         log::debug!("Table::delete_range");
 
-        let plan = self.schema.plan_query(&[], &range)?;
-        let indices = plan
-            .indices
-            .into_iter()
-            .map(|index_id| index_id.to_name())
-            .collect::<Vec<_>>();
-
-        let key_len = self.schema.key().len();
-
-        let mut deleted = 0;
-        while let Some(row) = self.first_inner(&indices, range.clone()).await? {
-            let key = row[..key_len].to_vec();
-            self.delete_row(key).await?;
-            deleted += 1;
-        }
-
-        Ok(deleted)
+        todo!()
     }
 
     /// Delete all rows from the `other` table from this one.
@@ -855,13 +669,13 @@ where
                 io::ErrorKind::InvalidInput,
                 format!(
                     "cannot delete the contents of a table with schema {:?} from one with schema {:?}",
-                    other.schema, self.schema
+                    other.schema.inner(), self.schema.inner()
                 ),
             )
             .into());
         }
 
-        let mut deletes = Vec::with_capacity(self.auxiliary.len() + 1);
+        let mut deletes = SmallVec::<[_; 16]>::with_capacity(self.auxiliary.len() + 1);
 
         deletes.push(self.primary.delete_all(other.primary));
 
@@ -889,13 +703,14 @@ where
                 io::ErrorKind::InvalidInput,
                 format!(
                     "cannot merge a table with schema {:?} into one with schema {:?}",
-                    other.schema, self.schema
+                    other.schema.inner(),
+                    self.schema.inner()
                 ),
             )
             .into());
         }
 
-        let mut merges = Vec::with_capacity(self.auxiliary.len() + 1);
+        let mut merges = SmallVec::<[_; 16]>::with_capacity(self.auxiliary.len() + 1);
 
         merges.push(self.primary.merge(other.primary));
 
@@ -916,17 +731,17 @@ where
         key: Vec<S::Value>,
         values: Vec<S::Value>,
     ) -> Result<bool, S::Error> {
-        let key = self.schema.validate_key(key)?;
-        let values = self.schema.validate_values(values)?;
+        let key = self.schema.inner().validate_key(key)?;
+        let values = self.schema.inner().validate_values(values)?;
 
         let mut row = key;
         row.extend(values);
 
-        let mut inserts = Vec::with_capacity(self.auxiliary.len() + 1);
+        let mut inserts = SmallVec::<[_; 16]>::with_capacity(self.auxiliary.len() + 1);
 
-        for index in self.auxiliary.values_mut() {
-            let row = IndexSchema::extract_key(self.schema.primary(), &row, index.schema());
-            inserts.push(index.insert(row));
+        for (name, index) in self.auxiliary.iter_mut() {
+            let index_key = self.schema.extract_key(name, &row);
+            inserts.push(index.insert(index_key.into_vec()));
         }
 
         inserts.push(self.primary.insert(row));
@@ -945,7 +760,7 @@ where
         #[cfg(feature = "logging")]
         log::debug!("Table::truncate");
 
-        let mut truncates = Vec::with_capacity(self.auxiliary.len() + 1);
+        let mut truncates = SmallVec::<[_; 16]>::with_capacity(self.auxiliary.len() + 1);
         truncates.push(self.primary.truncate());
 
         for index in self.auxiliary.values_mut() {
@@ -953,7 +768,14 @@ where
         }
 
         try_join_all(truncates).await?;
-
         Ok(())
     }
+}
+
+#[inline]
+fn bad_key<V: fmt::Debug>(key: &[V], key_len: usize) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid key: {key:?}, expected exactly {key_len} column(s)",),
+    )
 }

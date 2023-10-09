@@ -1,6 +1,6 @@
 [package]
 name = "b-table"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["code@tinychain.net"]
 edition = "2021"
 description = "A persistent database table based on b-tree"
@@ -22,7 +22,7 @@ required-features = ["stream"]
 
 [dependencies]
 async-trait = { version = "0.1", optional = true }
-b-tree = "~0.2.1"
+b-tree = { path = "../b-tree" }
 destream = { version = "0.7", optional = true }
 freqfs = "~0.8.2"
 futures = "0.3"
@@ -30,6 +30,7 @@ log = { version = "0.4", features = ["release_max_level_info"], optional = true 
 num_cpus = "1.15"
 pin-project = "1.1"
 safecast = "0.2"
+smallvec = "1.11"
 
 [dev-dependencies]
 destream = "0.7"
