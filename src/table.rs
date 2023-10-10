@@ -14,12 +14,9 @@ use safecast::AsType;
 use smallvec::SmallVec;
 
 use super::schema::*;
-use super::Node;
+use super::{IndexStack, Node};
 
 const PRIMARY: &str = "primary";
-const INDEX_STACK_SIZE: usize = 16;
-
-type IndexStack<T> = SmallVec<[T; INDEX_STACK_SIZE]>;
 
 /// A read guard acquired on a [`TableLock`]
 pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, Arc<DirReadGuardOwned<FE>>>;
@@ -27,8 +24,11 @@ pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, Arc<DirReadGuardOwned<FE
 /// A write guard acquired on a [`TableLock`]
 pub type TableWriteGuard<S, IS, C, FE> = Table<S, IS, C, DirWriteGuardOwned<FE>>;
 
+/// The type of row returned in a [`Stream`] of [`Rows`]
+pub type Row<V> = SmallVec<[V; 32]>;
+
 /// A stream of table rows
-pub type Rows<V> = Pin<Box<dyn Stream<Item = Result<Key<V>, io::Error>> + Send>>;
+pub type Rows<V> = Pin<Box<dyn Stream<Item = Result<Row<V>, io::Error>> + Send>>;
 
 /// A futures-aware read-write lock on a [`Table`]
 pub struct TableLock<S, IS, C, FE> {
@@ -411,23 +411,15 @@ where
     pub async fn first(
         &self,
         range: Range<S::Id, S::Value>,
-    ) -> Result<Option<Key<S::Value>>, io::Error> {
-        todo!()
-    }
-
-    async fn first_inner<'a>(
-        &'a self,
-        plan: &'a [Option<String>],
-        range: Range<S::Id, S::Value>,
-    ) -> Result<Option<Key<S::Value>>, io::Error> {
+    ) -> Result<Option<Row<S::Value>>, io::Error> {
         todo!()
     }
 
     /// Look up a row by its `key`.
-    pub async fn get_row<K: Into<Key<S::Value>>>(
+    pub async fn get_row<K: Into<b_tree::Key<S::Value>>>(
         &self,
         key: K,
-    ) -> Result<Option<Key<S::Value>>, io::Error> {
+    ) -> Result<Option<Row<S::Value>>, io::Error> {
         let key = key.into();
         let key_len = self.schema.key().len();
 
@@ -439,10 +431,10 @@ where
     }
 
     /// Look up a value by its `key`.
-    pub async fn get_value<K: Into<Key<S::Value>>>(
+    pub async fn get_value<K: Into<b_tree::Key<S::Value>>>(
         &self,
         key: K,
-    ) -> Result<Option<Key<S::Value>>, io::Error> {
+    ) -> Result<Option<Row<S::Value>>, io::Error> {
         let key = key.into();
         let key_len = self.schema.key().len();
 
@@ -489,6 +481,7 @@ where
             self.primary.is_empty(&b_tree::Range::default()).await
         } else {
             let mut rows = self.rows(range, &[], false, None)?;
+
             rows.try_next()
                 .map_ok(|maybe_row| maybe_row.is_none())
                 .await
@@ -506,6 +499,13 @@ where
         #[cfg(feature = "logging")]
         log::debug!("Table::rows with order {order:?}");
 
+        let select = select
+            .unwrap_or(self.schema.primary().columns())
+            .iter()
+            .collect();
+
+        let plan = QueryPlan::new(&self.schema, range, order, select);
+
         todo!()
     }
 
@@ -521,7 +521,7 @@ fn index_range_for<K: Eq + Hash, V>(
     columns: &[K],
     range: &mut HashMap<K, ColumnRange<V>>,
 ) -> b_tree::Range<V> {
-    let mut prefix = Key::with_capacity(range.len());
+    let mut prefix = b_tree::Key::with_capacity(range.len());
 
     for col_name in columns {
         if let Some(col_range) = range.remove(col_name) {
@@ -540,7 +540,10 @@ fn index_range_for<K: Eq + Hash, V>(
 }
 
 #[inline]
-fn inner_range<V>(mut prefix: Key<V>, column_range: Option<ColumnRange<V>>) -> b_tree::Range<V> {
+fn inner_range<V>(
+    mut prefix: b_tree::Key<V>,
+    column_range: Option<ColumnRange<V>>,
+) -> b_tree::Range<V> {
     if let Some(column_range) = column_range {
         match column_range {
             ColumnRange::Eq(value) => {
@@ -557,7 +560,7 @@ fn inner_range<V>(mut prefix: Key<V>, column_range: Option<ColumnRange<V>>) -> b
 fn prefix_extractor<K, V>(
     columns_in: &[K],
     columns_out: &[K],
-) -> Box<dyn Fn(Key<V>) -> Key<V> + Send>
+) -> Box<dyn Fn(b_tree::Key<V>) -> b_tree::Key<V> + Send>
 where
     K: PartialEq + fmt::Debug,
 {
@@ -591,7 +594,7 @@ where
     }
 
     Box::new(move |mut key| {
-        let mut prefix = Key::with_capacity(indices.len() + 1);
+        let mut prefix = b_tree::Key::with_capacity(indices.len() + 1);
 
         for i in indices.iter().copied() {
             prefix.push(key.remove(i));
@@ -626,7 +629,7 @@ where
 {
     /// Delete a row from this [`Table`] by its `key`.
     /// Returns `true` if the given `key` was present.
-    pub async fn delete_row(&mut self, key: Key<S::Value>) -> Result<bool, S::Error> {
+    pub async fn delete_row(&mut self, key: b_tree::Key<S::Value>) -> Result<bool, S::Error> {
         let row = if let Some(row) = self.get_row(key).await? {
             row
         } else {
