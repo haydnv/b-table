@@ -12,6 +12,8 @@ use crate::IndexStack;
 
 pub use b_tree::Schema as BTreeSchema;
 
+type Columns<'a, K> = SmallVec<[&'a K; ROW_STACK_SIZE]>;
+
 /// An ID type used to look up a specific table index
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
 pub enum IndexId<'a> {
@@ -43,19 +45,6 @@ impl<'a> fmt::Debug for IndexId<'a> {
             Self::Primary => f.write_str("primary"),
             Self::Auxiliary(id) => id.fmt(f),
         }
-    }
-}
-
-#[derive(Clone)]
-struct IndexQuery<'a, K, V> {
-    range: Range<K, V>,
-    order: &'a [K],
-    select: usize,
-}
-
-impl<'a, K, V> IndexQuery<'a, K, V> {
-    fn with_constraints(range: &mut Range<K, V>, order: &'a [K]) -> Option<Self> {
-        todo!()
     }
 }
 
@@ -333,11 +322,18 @@ where
 }
 
 #[derive(Clone)]
-pub(crate) struct QueryPlan<'a, K, V> {
-    indices: IndexStack<(IndexId<'a>, IndexQuery<'a, K, V>)>,
+pub(crate) struct IndexQuery<'a, K> {
+    pub range: Columns<'a, K>,
+    pub order: &'a [K],
+    pub select: usize,
 }
 
-impl<'a, K, V> Default for QueryPlan<'a, K, V> {
+#[derive(Clone)]
+pub(crate) struct QueryPlan<'a, K> {
+    pub indices: IndexStack<(IndexId<'a>, IndexQuery<'a, K>)>,
+}
+
+impl<'a, K> Default for QueryPlan<'a, K> {
     fn default() -> Self {
         Self {
             indices: IndexStack::default(),
@@ -345,18 +341,18 @@ impl<'a, K, V> Default for QueryPlan<'a, K, V> {
     }
 }
 
-impl<'a, K: Clone, V: Clone> QueryPlan<'a, K, V> {
+impl<'a, K: Clone + Eq + Hash> QueryPlan<'a, K> {
     pub fn new<S>(
         schema: &'a TableSchema<S>,
-        mut range: Range<K, V>,
+        range: &'a Range<K, S::Value>,
         order: &'a [K],
     ) -> Option<Self>
     where
-        S: Schema<Id = K, Value = V>,
+        S: Schema<Id = K>,
     {
         let candidate = Self::default();
 
-        if candidate.supports(schema, &range, order) {
+        if candidate.supports(schema, range, order) {
             return Some(candidate);
         }
 
@@ -367,10 +363,10 @@ impl<'a, K: Clone, V: Clone> QueryPlan<'a, K, V> {
             for (index_id, index) in schema.indices() {
                 // check whether this candidate needs the given index
                 // if so, create a new candidate with this index name and add it to the queue
-                if let Some(query) = candidate.needs::<S>(index, &mut range, order) {
+                if let Some(query) = candidate.needs::<S>(schema, index, range, order) {
                     let candidate = candidate.clone_and_push(index_id, query);
 
-                    if candidate.supports(schema, &range, order) {
+                    if candidate.supports(schema, range, order) {
                         return Some(candidate);
                     } else {
                         candidates.push_back(candidate);
@@ -382,25 +378,86 @@ impl<'a, K: Clone, V: Clone> QueryPlan<'a, K, V> {
         None
     }
 
-    fn clone_and_push(&self, index_id: IndexId<'a>, query: IndexQuery<'a, K, V>) -> Self {
+    fn clone_and_push(&self, index_id: IndexId<'a>, query: IndexQuery<'a, K>) -> Self {
         let mut clone = self.clone();
         clone.indices.push((index_id, query));
         clone
     }
 
-    fn needs<S: Schema>(
+    fn needs<S>(
         &self,
+        schema: &'a TableSchema<S>,
         index: &'a S::Index,
-        range: &mut Range<S::Id, S::Value>,
-        order: &'a [S::Id],
-    ) -> Option<IndexQuery<'a, S::Id, S::Value>> {
+        range: &'a Range<K, S::Value>,
+        order: &'a [K],
+    ) -> Option<IndexQuery<'a, K>>
+    where
+        S: Schema<Id = K>,
+    {
         // check what columns this plan must select
+        let mut selected = Columns::with_capacity(schema.primary().len());
 
-        // check how much of the given range this plan supports without contradicting the given order
+        for (index_id, query) in &self.indices {
+            let index = schema.get_index(*index_id);
 
-        // return a descriptor of which part of the range and order can be used to select which columns
+            for col_name in &index.columns()[..query.select] {
+                if !selected.contains(&col_name) {
+                    selected.push(col_name);
+                }
+            }
+        }
 
-        todo!()
+        // and what order remains un-covered
+        let order_offset = order
+            .iter()
+            .take_while(|col_name| selected.contains(col_name))
+            .count();
+
+        let order = &order[order_offset..];
+
+        // then determine the minimum number of columns needed from this index
+        let mut i = 0;
+
+        // by checking how much of the given range this plan supports without contradicting the given order
+        let mut index_range = Columns::with_capacity(range.len());
+        let mut index_order = Columns::with_capacity(index.len());
+
+        for col_name in index.columns() {
+            if let Some(column_range) = range.get(col_name) {
+                if i < order.len() {
+                    if &order[i] == col_name {
+                        index_order.push(col_name);
+                    } else {
+                        break;
+                    }
+                }
+
+                index_range.push(col_name);
+                i += 1;
+
+                if column_range.is_range() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // and how much of the given order this index supports
+        while i < index.len() && index.columns().get(i) == order.get(i) {
+            i += 1;
+        }
+
+        // to determine which part of the range and order can be used to select which columns
+        if i == 0 {
+            None
+        } else {
+            Some(IndexQuery {
+                range: index_range,
+                order: &order[..index_order.len()],
+                select: i,
+            })
+        }
     }
 
     fn supports<S: Schema>(
@@ -409,8 +466,8 @@ impl<'a, K: Clone, V: Clone> QueryPlan<'a, K, V> {
         range: &Range<S::Id, S::Value>,
         order: &[S::Id],
     ) -> bool {
-        let mut supported_range = SmallVec::<[&S::Id; ROW_STACK_SIZE]>::with_capacity(range.len());
-        let mut supported_order = SmallVec::<[&S::Id; ROW_STACK_SIZE]>::with_capacity(order.len());
+        let mut supported_range = Columns::with_capacity(range.len());
+        let mut supported_order = Columns::with_capacity(order.len());
 
         for (index_id, query) in &self.indices {
             let index = schema.get_index(*index_id);

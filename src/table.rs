@@ -502,9 +502,25 @@ where
         #[cfg(feature = "logging")]
         log::debug!("Table::rows with order {order:?}");
 
+        let mut plan = QueryPlan::new(&self.schema, &range, order).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{self:?} has no index to query {range:?} with order {order:?}"),
+            )
+        })?;
+
+        while let Some((index_id, index_query)) = plan.indices.pop() {
+            let index = self.get_index(index_id);
+
+            // construct the range by subtracting from the global range
+            // construct the order by subtracting from the global order
+            // construct a stream of keys in the index
+        }
+
         let select = select.unwrap_or(self.schema.primary().columns());
 
-        let plan = QueryPlan::new(&self.schema, range, order);
+        // if the merged index stream contains all the selected columns, return it
+        // otherwise, extract the primary key from each key in the stream and select it from the primary index
 
         todo!()
     }
@@ -513,6 +529,12 @@ where
     pub async fn into_rows(self) -> Result<Rows<S::Value>, io::Error> {
         let rows = self.primary.keys(b_tree::Range::default(), false).await?;
         Ok(Box::pin(rows))
+    }
+}
+
+impl<S: fmt::Debug, IS, C, G> fmt::Debug for Table<S, IS, C, G> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "table with schema {:?}", self.schema.inner())
     }
 }
 
