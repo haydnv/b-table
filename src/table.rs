@@ -18,6 +18,9 @@ use super::{IndexStack, Node};
 
 const PRIMARY: &str = "primary";
 
+/// The maximum number of values in a stack-allocated [`Row`]
+pub const ROW_STACK_SIZE: usize = 32;
+
 /// A read guard acquired on a [`TableLock`]
 pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, Arc<DirReadGuardOwned<FE>>>;
 
@@ -25,7 +28,7 @@ pub type TableReadGuard<S, IS, C, FE> = Table<S, IS, C, Arc<DirReadGuardOwned<FE
 pub type TableWriteGuard<S, IS, C, FE> = Table<S, IS, C, DirWriteGuardOwned<FE>>;
 
 /// The type of row returned in a [`Stream`] of [`Rows`]
-pub type Row<V> = SmallVec<[V; 32]>;
+pub type Row<V> = SmallVec<[V; ROW_STACK_SIZE]>;
 
 /// A stream of table rows
 pub type Rows<V> = Pin<Box<dyn Stream<Item = Result<Row<V>, io::Error>> + Send>>;
@@ -499,12 +502,9 @@ where
         #[cfg(feature = "logging")]
         log::debug!("Table::rows with order {order:?}");
 
-        let select = select
-            .unwrap_or(self.schema.primary().columns())
-            .iter()
-            .collect();
+        let select = select.unwrap_or(self.schema.primary().columns());
 
-        let plan = QueryPlan::new(&self.schema, range, order, select);
+        let plan = QueryPlan::new(&self.schema, range, order);
 
         todo!()
     }
@@ -791,10 +791,10 @@ fn bad_key<V: fmt::Debug>(key: &[V], key_len: usize) -> io::Error {
 #[inline]
 fn try_join_all<'a, O, F>(
     mut futures: IndexStack<F>,
-) -> Pin<Box<dyn Future<Output = Result<IndexStack<O>, io::Error>> + 'a>>
+) -> Pin<Box<dyn Future<Output = Result<IndexStack<O>, io::Error>> + Send + 'a>>
 where
-    O: 'a,
-    F: Future<Output = Result<O, io::Error>> + 'a,
+    O: Send + 'a,
+    F: Future<Output = Result<O, io::Error>> + Send + 'a,
 {
     Box::pin(async move {
         if let Some(fut) = futures.pop() {

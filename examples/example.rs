@@ -4,7 +4,7 @@ use std::ops::Bound;
 use std::path::PathBuf;
 
 use b_table::collate::{self, Collate};
-use b_table::{BTreeSchema, IndexSchema as IndexSchemaInstance, Key, Node, Range, TableLock};
+use b_table::{BTreeSchema, IndexSchema as IndexSchemaInstance, Node, Range, TableLock};
 use destream::en;
 use destream_json::Value;
 use freqfs::Cache;

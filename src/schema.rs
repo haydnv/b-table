@@ -4,14 +4,13 @@ use std::hash::Hash;
 use std::ops::{Bound, Deref};
 use std::{fmt, io, iter};
 
-use b_tree::collate::{Collate, Overlap, OverlapsRange, OverlapsValue};
+use b_tree::collate::*;
 use smallvec::SmallVec;
 
+use crate::table::ROW_STACK_SIZE;
 use crate::IndexStack;
 
 pub use b_tree::Schema as BTreeSchema;
-
-pub(crate) type Selection<'a, K> = SmallVec<[&'a K; 32]>;
 
 /// An ID type used to look up a specific table index
 #[derive(Copy, Clone, Eq, PartialEq, Hash)]
@@ -51,15 +50,11 @@ impl<'a> fmt::Debug for IndexId<'a> {
 struct IndexQuery<'a, K, V> {
     range: Range<K, V>,
     order: &'a [K],
-    select: Selection<'a, K>,
+    select: usize,
 }
 
 impl<'a, K, V> IndexQuery<'a, K, V> {
-    fn with_constraints(
-        range: &mut Range<K, V>,
-        order: &'a [K],
-        select: Selection<'a, K>,
-    ) -> Option<Self> {
+    fn with_constraints(range: &mut Range<K, V>, order: &'a [K]) -> Option<Self> {
         todo!()
     }
 }
@@ -337,34 +332,31 @@ where
     }
 }
 
-#[inline]
-fn get_index<'a, S: Schema>(schema: &'a S, index_id: IndexId<'a>) -> &'a S::Index {
-    match index_id {
-        IndexId::Primary => schema.primary(),
-        IndexId::Auxiliary(index_id) => schema
-            .auxiliary()
-            .iter()
-            .filter_map(|(name, index)| if name == index_id { Some(index) } else { None })
-            .next()
-            .expect("index"),
+#[derive(Clone)]
+pub(crate) struct QueryPlan<'a, K, V> {
+    indices: IndexStack<(IndexId<'a>, IndexQuery<'a, K, V>)>,
+}
+
+impl<'a, K, V> Default for QueryPlan<'a, K, V> {
+    fn default() -> Self {
+        Self {
+            indices: IndexStack::default(),
+        }
     }
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct QueryPlan<'a> {
-    indices: IndexStack<IndexId<'a>>,
-}
-
-impl<'a> QueryPlan<'a> {
-    pub fn new<S: Schema>(
+impl<'a, K: Clone, V: Clone> QueryPlan<'a, K, V> {
+    pub fn new<S>(
         schema: &'a TableSchema<S>,
-        mut range: Range<S::Id, S::Value>,
-        order: &'a [S::Id],
-        selection: Selection<'a, S::Id>,
-    ) -> Option<Self> {
+        mut range: Range<K, V>,
+        order: &'a [K],
+    ) -> Option<Self>
+    where
+        S: Schema<Id = K, Value = V>,
+    {
         let candidate = Self::default();
 
-        if candidate.supports(&range, order, &selection) {
+        if candidate.supports(schema, &range, order) {
             return Some(candidate);
         }
 
@@ -375,10 +367,10 @@ impl<'a> QueryPlan<'a> {
             for (index_id, index) in schema.indices() {
                 // check whether this candidate needs the given index
                 // if so, create a new candidate with this index name and add it to the queue
-                if let Some(query) = candidate.needs::<S>(index, &mut range, order, &selection) {
+                if let Some(query) = candidate.needs::<S>(index, &mut range, order) {
                     let candidate = candidate.clone_and_push(index_id, query);
 
-                    if candidate.supports(&range, order, &selection) {
+                    if candidate.supports(schema, &range, order) {
                         return Some(candidate);
                     } else {
                         candidates.push_back(candidate);
@@ -390,9 +382,9 @@ impl<'a> QueryPlan<'a> {
         None
     }
 
-    fn clone_and_push<K, V>(&self, index_id: IndexId<'a>, query: IndexQuery<'a, K, V>) -> Self {
+    fn clone_and_push(&self, index_id: IndexId<'a>, query: IndexQuery<'a, K, V>) -> Self {
         let mut clone = self.clone();
-        clone.indices.push(index_id);
+        clone.indices.push((index_id, query));
         clone
     }
 
@@ -401,9 +393,8 @@ impl<'a> QueryPlan<'a> {
         index: &'a S::Index,
         range: &mut Range<S::Id, S::Value>,
         order: &'a [S::Id],
-        selection: &Selection<'a, S::Id>,
     ) -> Option<IndexQuery<'a, S::Id, S::Value>> {
-        // check what columns this
+        // check what columns this plan must select
 
         // check how much of the given range this plan supports without contradicting the given order
 
@@ -412,8 +403,44 @@ impl<'a> QueryPlan<'a> {
         todo!()
     }
 
-    fn supports<K, V>(&self, range: &Range<K, V>, order: &[K], selection: &Selection<K>) -> bool {
-        todo!()
+    fn supports<S: Schema>(
+        &self,
+        schema: &TableSchema<S>,
+        range: &Range<S::Id, S::Value>,
+        order: &[S::Id],
+    ) -> bool {
+        let mut supported_range = SmallVec::<[&S::Id; ROW_STACK_SIZE]>::with_capacity(range.len());
+        let mut supported_order = SmallVec::<[&S::Id; ROW_STACK_SIZE]>::with_capacity(order.len());
+
+        for (index_id, query) in &self.indices {
+            let index = schema.get_index(*index_id);
+            let index_columns = &index.columns()[..query.select];
+
+            for col_name in index_columns {
+                match range.get(col_name) {
+                    None => break,
+                    Some(col_range) => {
+                        if !supported_range.contains(&col_name) {
+                            supported_range.push(col_name);
+                        }
+
+                        if col_range.is_range() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            for (col_name, order) in index_columns.iter().zip(&order[supported_order.len()..]) {
+                if col_name == order {
+                    supported_order.push(col_name);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        range.len() == supported_range.len() && order.len() == supported_order.len()
     }
 }
 
@@ -429,8 +456,22 @@ impl<S> TableSchema<S> {
 }
 
 impl<S: Schema> TableSchema<S> {
+    #[inline]
     pub fn extract_key(&self, index_name: &str, row: &[S::Value]) -> b_tree::Key<S::Value> {
         todo!()
+    }
+
+    #[inline]
+    fn get_index<'a>(&'a self, index_id: IndexId<'a>) -> &'a S::Index {
+        match index_id {
+            IndexId::Primary => self.primary(),
+            IndexId::Auxiliary(index_id) => self
+                .auxiliary()
+                .iter()
+                .filter_map(|(name, index)| if name == index_id { Some(index) } else { None })
+                .next()
+                .expect("index"),
+        }
     }
 
     pub fn indices(&self) -> impl Iterator<Item = (IndexId, &S::Index)> {
