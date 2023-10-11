@@ -512,7 +512,7 @@ where
         })?;
 
         let mut keys: b_tree::Keys<S::Value> = Box::pin(futures::stream::empty());
-        let mut index_columns = None;
+        let mut index_columns = Option::<&[S::Id]>::None;
 
         while let Some((index_id, index_query)) = plan.indices.pop() {
             let index = self.get_index(index_id).expect("index");
@@ -521,12 +521,32 @@ where
             let index_range = index_range_for(&index_query.range, &mut range);
 
             // construct a stream of keys in the index
-            if let Some(columns) = index_columns {
-                todo!()
+            keys = if let Some(columns_in) = index_columns {
+                let columns = index.schema().columns();
+                debug_assert!(index_query.select <= columns.len());
+
+                let column_range = columns
+                    .get(index_query.select)
+                    .and_then(|col_name| range.remove(col_name));
+
+                let columns_out = &columns[..index_query.select];
+                let extractor =
+                    prefix_extractor(&columns_in.iter().collect::<Key<&S::Id>>(), columns_out);
+
+                let index = index.clone();
+                let keys = keys
+                    .map_ok(extractor)
+                    .map_ok(move |prefix| inner_range(prefix, column_range.clone()))
+                    .map_ok(move |range| index.clone().keys(range, reverse))
+                    .try_buffered(num_cpus::get())
+                    .try_flatten();
+
+                Box::pin(keys)
             } else {
-                index_columns = Some(index.schema().columns());
-                keys = index.clone().keys(index_range, reverse).await?;
-            }
+                index.clone().keys(index_range, reverse).await?
+            };
+
+            index_columns = Some(index.schema().columns());
         }
 
         let (columns, keys) = match (index_columns, keys) {
@@ -632,10 +652,11 @@ fn prefix_extractor<K, V>(
 where
     K: PartialEq + fmt::Debug,
 {
+    debug_assert!(columns_out.len() <= columns_in.len());
     debug_assert!(!columns_out.is_empty());
     debug_assert!(
         columns_out.iter().all(|id| columns_in.contains(&id)),
-        "{columns_out:?} is not a superset of {columns_in:?}"
+        "{columns_out:?} is not a subset of {columns_in:?}"
     );
 
     #[cfg(feature = "logging")]

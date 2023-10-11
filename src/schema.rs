@@ -324,7 +324,6 @@ where
 #[derive(Clone)]
 pub(crate) struct IndexQuery<'a, K> {
     pub range: Columns<'a, K>,
-    pub order: &'a [K],
     pub select: usize,
 }
 
@@ -420,16 +419,11 @@ impl<'a, K: Clone + Eq + Hash> QueryPlan<'a, K> {
 
         // by checking how much of the given range this plan supports without contradicting the given order
         let mut index_range = Columns::with_capacity(range.len());
-        let mut index_order = Columns::with_capacity(index.len());
 
         for col_name in index.columns() {
             if let Some(column_range) = range.get(col_name) {
-                if i < order.len() {
-                    if &order[i] == col_name {
-                        index_order.push(col_name);
-                    } else {
-                        break;
-                    }
+                if i < order.len() && &order[i] != col_name {
+                    break;
                 }
 
                 index_range.push(col_name);
@@ -454,7 +448,6 @@ impl<'a, K: Clone + Eq + Hash> QueryPlan<'a, K> {
         } else {
             Some(IndexQuery {
                 range: index_range,
-                order: &order[..index_order.len()],
                 select: i,
             })
         }
