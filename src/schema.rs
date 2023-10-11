@@ -76,7 +76,7 @@ pub trait IndexSchema: BTreeSchema + Clone {
 }
 
 /// The schema of a [`Table`]
-pub trait Schema: Eq + Sized + fmt::Debug {
+pub trait Schema: Eq + Send + Sync + Sized + fmt::Debug {
     /// The type of human-readable identifier used by columns and indices in this [`Schema`]
     type Id: Hash + Eq + Clone + Send + Sync + fmt::Debug + fmt::Display + 'static;
 
@@ -344,7 +344,7 @@ impl<'a, K> Default for QueryPlan<'a, K> {
 impl<'a, K: Clone + Eq + Hash> QueryPlan<'a, K> {
     pub fn new<S>(
         schema: &'a TableSchema<S>,
-        range: &'a Range<K, S::Value>,
+        range: &HashMap<K, ColumnRange<S::Value>>,
         order: &'a [K],
     ) -> Option<Self>
     where
@@ -388,7 +388,7 @@ impl<'a, K: Clone + Eq + Hash> QueryPlan<'a, K> {
         &self,
         schema: &'a TableSchema<S>,
         index: &'a S::Index,
-        range: &'a Range<K, S::Value>,
+        range: &HashMap<K, ColumnRange<S::Value>>,
         order: &'a [K],
     ) -> Option<IndexQuery<'a, K>>
     where
@@ -398,7 +398,7 @@ impl<'a, K: Clone + Eq + Hash> QueryPlan<'a, K> {
         let mut selected = Columns::with_capacity(schema.primary().len());
 
         for (index_id, query) in &self.indices {
-            let index = schema.get_index(*index_id);
+            let index = schema.get_index(*index_id).expect("index");
 
             for col_name in &index.columns()[..query.select] {
                 if !selected.contains(&col_name) {
@@ -463,14 +463,14 @@ impl<'a, K: Clone + Eq + Hash> QueryPlan<'a, K> {
     fn supports<S: Schema>(
         &self,
         schema: &TableSchema<S>,
-        range: &Range<S::Id, S::Value>,
+        range: &HashMap<S::Id, ColumnRange<S::Value>>,
         order: &[S::Id],
     ) -> bool {
         let mut supported_range = Columns::with_capacity(range.len());
         let mut supported_order = Columns::with_capacity(order.len());
 
         for (index_id, query) in &self.indices {
-            let index = schema.get_index(*index_id);
+            let index = schema.get_index(*index_id).expect("index");
             let index_columns = &index.columns()[..query.select];
 
             for col_name in index_columns {
@@ -514,20 +514,26 @@ impl<S> TableSchema<S> {
 
 impl<S: Schema> TableSchema<S> {
     #[inline]
-    pub fn extract_key(&self, index_name: &str, row: &[S::Value]) -> b_tree::Key<S::Value> {
-        todo!()
+    pub fn extract_key(&self, index_id: IndexId, row: &[S::Value]) -> b_tree::Key<S::Value> {
+        let index = self.get_index(index_id).expect("index");
+
+        index
+            .columns()
+            .iter()
+            .filter_map(|col_name| self.primary().columns().iter().position(|c| c == col_name))
+            .map(|i| row[i].clone())
+            .collect()
     }
 
     #[inline]
-    fn get_index<'a>(&'a self, index_id: IndexId<'a>) -> &'a S::Index {
+    fn get_index<'a>(&'a self, index_id: IndexId<'a>) -> Option<&'a S::Index> {
         match index_id {
-            IndexId::Primary => self.primary(),
+            IndexId::Primary => Some(self.primary()),
             IndexId::Auxiliary(index_id) => self
                 .auxiliary()
                 .iter()
                 .filter_map(|(name, index)| if name == index_id { Some(index) } else { None })
-                .next()
-                .expect("index"),
+                .next(),
         }
     }
 

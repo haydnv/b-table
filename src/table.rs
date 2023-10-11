@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::{fmt, io};
 
 use b_tree::collate::Collate;
-use b_tree::{BTree, BTreeLock};
+use b_tree::{BTree, BTreeLock, Key};
 use freqfs::{DirDeref, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
 use futures::future::{Future, TryFutureExt};
 use futures::stream::{Stream, TryStreamExt};
@@ -467,7 +467,7 @@ where
             self.primary.count(&b_tree::Range::default()).await
         } else {
             // TODO: optimize
-            let mut rows = self.rows(range, &[], false, None)?;
+            let mut rows = self.rows(range, &[], false, None).await?;
 
             let mut count = 0;
             while let Some(_row) = rows.try_next().await? {
@@ -483,7 +483,7 @@ where
         if range.is_default() {
             self.primary.is_empty(&b_tree::Range::default()).await
         } else {
-            let mut rows = self.rows(range, &[], false, None)?;
+            let mut rows = self.rows(range, &[], false, None).await?;
 
             rows.try_next()
                 .map_ok(|maybe_row| maybe_row.is_none())
@@ -491,8 +491,8 @@ where
         }
     }
 
-    /// Construct a [`Stream`] of the values of the `selected` columns within the given `range`.
-    pub fn rows(
+    /// Construct a [`Stream`] of the `select`ed columns of the [`Rows`] within the given `range`.
+    pub async fn rows(
         &self,
         range: Range<S::Id, S::Value>,
         order: &[S::Id],
@@ -502,6 +502,8 @@ where
         #[cfg(feature = "logging")]
         log::debug!("Table::rows with order {order:?}");
 
+        let mut range = range.into_inner();
+
         let mut plan = QueryPlan::new(&self.schema, &range, order).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -509,20 +511,64 @@ where
             )
         })?;
 
+        let mut keys: b_tree::Keys<S::Value> = Box::pin(futures::stream::empty());
+        let mut index_columns = None;
+
         while let Some((index_id, index_query)) = plan.indices.pop() {
-            let index = self.get_index(index_id);
+            let index = self.get_index(index_id).expect("index");
 
             // construct the range by subtracting from the global range
-            // construct the order by subtracting from the global order
+            let index_range = index_range_for(&index_query.range, &mut range);
+
             // construct a stream of keys in the index
+            if let Some(columns) = index_columns {
+                todo!()
+            } else {
+                index_columns = Some(index.schema().columns());
+                keys = index.clone().keys(index_range, reverse).await?;
+            }
         }
+
+        let (columns, keys) = match (index_columns, keys) {
+            (Some(columns), keys) => (columns, keys),
+            (None, _) => {
+                let columns = self.schema.primary().columns();
+                let range = index_range_for(&columns.iter().collect::<Key<&S::Id>>(), &mut range);
+                let keys = self.primary.clone().keys(range, reverse).await?;
+                (columns, keys)
+            }
+        };
+
+        assert!(range.is_empty());
 
         let select = select.unwrap_or(self.schema.primary().columns());
 
-        // if the merged index stream contains all the selected columns, return it
-        // otherwise, extract the primary key from each key in the stream and select it from the primary index
+        if select.iter().all(|col_name| columns.contains(col_name)) {
+            // if the merged index stream contains all the selected columns, return it
+            let columns: Key<&S::Id> = columns.iter().collect();
+            let extractor = prefix_extractor(&columns, select);
+            let rows = keys.map_ok(extractor);
+            Ok(Box::pin(rows))
+        } else {
+            // otherwise, extract the primary key from each key in the stream
+            // and select it from the primary index
 
-        todo!()
+            let columns: Key<&S::Id> = columns.iter().collect();
+            let extractor = prefix_extractor(&columns, self.schema.key());
+
+            let primary = self.primary.clone();
+            let rows = keys
+                .map_ok(extractor)
+                .map_ok(move |key| {
+                    let key = key.into();
+                    let primary = primary.clone();
+                    async move { primary.first(&key).await }
+                })
+                .try_buffered(num_cpus::get())
+                .map_ok(|maybe_key| maybe_key.expect("row"));
+
+            Ok(Box::pin(rows))
+        }
     }
 
     /// Consume this [`TableReadGuard`] to construct a [`Stream`] of all the rows in the [`Table`].
@@ -540,7 +586,7 @@ impl<S: fmt::Debug, IS, C, G> fmt::Debug for Table<S, IS, C, G> {
 
 #[inline]
 fn index_range_for<K: Eq + Hash, V>(
-    columns: &[K],
+    columns: &[&K],
     range: &mut HashMap<K, ColumnRange<V>>,
 ) -> b_tree::Range<V> {
     let mut prefix = b_tree::Key::with_capacity(range.len());
@@ -580,34 +626,37 @@ fn inner_range<V>(
 }
 
 fn prefix_extractor<K, V>(
-    columns_in: &[K],
+    columns_in: &[&K],
     columns_out: &[K],
-) -> Box<dyn Fn(b_tree::Key<V>) -> b_tree::Key<V> + Send>
+) -> Box<dyn Fn(Key<V>) -> Key<V> + Send>
 where
     K: PartialEq + fmt::Debug,
 {
     debug_assert!(!columns_out.is_empty());
     debug_assert!(
-        columns_out.iter().all(|id| columns_in.contains(id)),
+        columns_out.iter().all(|id| columns_in.contains(&id)),
         "{columns_out:?} is not a superset of {columns_in:?}"
     );
 
     #[cfg(feature = "logging")]
     log::trace!("extract columns {columns_out:?} from {columns_in:?}");
 
-    if columns_in == columns_out {
+    if columns_in.len()
+        == columns_in
+            .iter()
+            .zip(columns_out)
+            .filter(|(i, o)| *i == o)
+            .count()
+    {
         return Box::new(|key| key);
     }
 
     let mut indices = IndexStack::with_capacity(columns_out.len());
 
-    for name_out in columns_out
-        .iter()
-        .take_while(|name| columns_in.contains(name))
-    {
+    for name_out in columns_out {
         let mut index = columns_in
             .iter()
-            .position(|name_in| name_in == name_out)
+            .position(|name_in| *name_in == name_out)
             .expect("index");
 
         index -= indices.iter().copied().filter(|i| *i < index).count();
@@ -662,7 +711,7 @@ where
 
         for (name, index) in self.auxiliary.iter_mut() {
             deletes.push(async {
-                let index_key = self.schema.extract_key(name, &row);
+                let index_key = self.schema.extract_key(name.into(), &row);
                 index.delete(&index_key).await
             })
         }
@@ -769,7 +818,7 @@ where
         let mut inserts = IndexStack::with_capacity(self.auxiliary.len() + 1);
 
         for (name, index) in self.auxiliary.iter_mut() {
-            let index_key = self.schema.extract_key(name, &row);
+            let index_key = self.schema.extract_key(name.into(), &row);
             inserts.push(index.insert(index_key.into_vec()));
         }
 
