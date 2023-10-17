@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::hash::Hash;
 use std::ops::{Bound, Deref};
 use std::{fmt, io, iter};
@@ -317,7 +317,7 @@ impl<'a, K: fmt::Debug> fmt::Debug for IndexQuery<'a, K> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "query {} columns with a range over {:?}",
+            "query {} column(s) with a range over {:?}",
             self.select, self.range
         )
     }
@@ -333,6 +333,19 @@ impl<'a, K> Default for QueryPlan<'a, K> {
         Self {
             indices: IndexStack::default(),
         }
+    }
+}
+
+impl<'a, K: Eq> Ord for QueryPlan<'a, K> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // inverse order based on number of indices to query
+        other.indices.len().cmp(&self.indices.len())
+    }
+}
+
+impl<'a, K: Eq> PartialOrd for QueryPlan<'a, K> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -353,23 +366,39 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
             return Some(candidate);
         }
 
-        let mut candidates = VecDeque::with_capacity((schema.auxiliary().len() + 1) * 2);
-        candidates.push_back(candidate);
+        let mut candidates = BinaryHeap::with_capacity((schema.auxiliary().len() + 1) * 2);
 
-        while let Some(candidate) = candidates.pop_front() {
+        let mut unvisited = VecDeque::with_capacity(candidates.capacity());
+        unvisited.push_back(candidate);
+
+        // first, create a list of all candidates which cover the requested order (if any)
+        while let Some(candidate) = unvisited.pop_front() {
+            if candidates.iter().any(|c| c == &candidate) {
+                continue;
+            }
+
             for index_id in schema.index_ids() {
-                // check whether this candidate needs the given index
-                // if so, create a new candidate with this index name and add it to the queue
-                if let Some(query) = candidate.needs::<S>(schema, index_id, range, order) {
+                if let Some(query) = candidate.needs(schema, index_id, range, order) {
                     let candidate = candidate.clone_and_push(index_id, query);
-
-                    if candidate.supports(schema, range, order) {
-                        return Some(candidate);
-                    } else {
-                        println!("{candidate:?} does not support {range:?} with order {order:?}");
-                        candidates.push_back(candidate);
-                    }
+                    unvisited.push_back(candidate);
                 }
+            }
+
+            if candidate.supported_order(schema, order) == order {
+                candidates.push(candidate);
+            }
+        }
+
+        // then winnow down to only candidates which support the largest portion of the range
+        let max_supported_range = candidates
+            .iter()
+            .map(|candidate| candidate.supported_range(schema, range).len())
+            .fold(0, Ord::max);
+
+        // then winnow by candidate size (number of indices to query)
+        while let Some(candidate) = candidates.pop() {
+            if candidate.supported_range(schema, range).len() == max_supported_range {
+                return Some(candidate);
             }
         }
 
@@ -394,56 +423,56 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
     {
         // check what columns are already selected by this plan
         // and which range columns are already covered
-        let mut selected = Columns::with_capacity(schema.primary().len());
+        let mut query_order = order;
+        let mut selected = &schema.primary().columns()[..0];
         let mut covered = Columns::with_capacity(range.len());
 
         for (index_id, query) in &self.indices {
             let index = schema.get_index(*index_id).expect("index");
 
-            for col_name in &index.columns()[..query.select] {
-                if !selected.contains(&col_name) {
-                    selected.push(col_name);
-                }
+            selected = &index.columns()[..query.select];
+
+            if query.select < query_order.len() {
+                query_order = &query_order[query.select..];
             }
 
             for col_name in &query.range {
-                assert!(!covered.contains(col_name));
+                debug_assert!(!covered.contains(col_name));
+                debug_assert!(selected.contains(col_name));
                 covered.push(*col_name);
             }
         }
 
         // assert that the covered columns don't contradict the range
-        assert!(covered.len() <= range.len());
-        assert!(covered.iter().all(|c| range.contains_key(c)));
-
-        // assert that the selected columns don't contradict the order
-        assert!(order
-            .iter()
-            .take(selected.len())
-            .all(|c| selected.contains(&c)));
-
-        println!("selected columns: {selected:?}");
+        debug_assert!(covered.len() <= range.len());
+        debug_assert!(covered.iter().all(|c| range.contains_key(c)));
 
         // now that this plan has been characterized, check if it needs this index
         let index = schema.get_index(index_id).expect("index");
 
-        let already_selected = index
+        let prefix_len = if index
             .columns()
             .iter()
-            .take_while(|c| selected.contains(c))
-            .count();
+            .take(selected.len())
+            .all(|c| selected.contains(c))
+        {
+            selected.len()
+        } else {
+            return None;
+        };
 
         // first, check if any range columns remain un-covered
         let uncovered_range = if covered.len() < range.len() {
             // and if so which of them this index can cover without contradicting the order
             let mut uncovered = Columns::with_capacity(range.len() - covered.len());
 
-            println!(
-                "{} range columns are still not covered",
-                range.len() - covered.len()
-            );
+            for (i, col_name) in index.columns().iter().enumerate().skip(prefix_len) {
+                if let Some(order_col) = query_order.get(i) {
+                    if col_name != order_col {
+                        break;
+                    }
+                }
 
-            for col_name in &index.columns()[already_selected..] {
                 if let Some(col_range) = range.get(col_name) {
                     uncovered.push(col_name);
 
@@ -455,8 +484,6 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
                 }
             }
 
-            println!("uncovered range columns: {uncovered:?}");
-
             uncovered
         } else {
             Default::default()
@@ -464,80 +491,83 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
 
         assert!(covered.len() + uncovered_range.len() <= range.len());
 
-        let select = if covered.len() + uncovered_range.len() == range.len() {
-            // then, if the entire range is covered, check if this index can provide the remaining order
-            let mut select = uncovered_range.len();
+        // then check if this index can provide any of the remaining order
+        let index_order = &index.columns()[prefix_len + uncovered_range.len()..];
 
-            let query_order = order.iter().skip(selected.len() + uncovered_range.len());
-            let index_order = &index.columns()[already_selected + uncovered_range.len()..];
-
-            println!("query order is {query_order:?}, index order is {index_order:?}, already selected {already_selected}");
-
-            select += index_order
+        let select = uncovered_range.len()
+            + index_order
                 .into_iter()
                 .zip(query_order)
                 .take_while(|(i, q)| i == q)
                 .count();
 
-            println!(
-                "order columns: {:?}",
-                &index.columns()[..already_selected + select]
-            );
-
-            select
-        } else {
-            uncovered_range.len()
-        };
-
         // if this index provides range or order coverage, it is needed
         if select > 0 {
             Some(IndexQuery {
                 range: uncovered_range,
-                select: already_selected + select,
+                select: prefix_len + select,
             })
         } else {
             None
         }
     }
 
-    fn supports<S>(
-        &self,
-        schema: &TableSchema<S>,
-        range: &HashMap<K, ColumnRange<S::Value>>,
-        order: &[K],
-    ) -> bool
+    fn supported_order<S>(&self, schema: &TableSchema<S>, order: &'a [K]) -> &'a [K]
     where
         S: Schema<Id = K>,
     {
-        let mut supported_range = Columns::with_capacity(range.len());
-        let mut supported_order = Columns::with_capacity(order.len());
+        let mut i = 0;
 
         for (index_id, query) in &self.indices {
+            debug_assert!(query.select >= query.range.len());
+            debug_assert!(order
+                .iter()
+                .skip(i)
+                .zip(query.range.iter())
+                .all(|(o, c)| o == *c));
+
             let index = schema.get_index(*index_id).expect("index");
 
-            for col_name in &query.range {
-                assert!(!supported_range.contains(&col_name));
-                supported_range.push(col_name);
+            i += order
+                .iter()
+                .skip(i)
+                .zip(&index.columns()[..query.select])
+                .take_while(|(o, c)| o == c)
+                .count();
+        }
 
-                if supported_order.len() < order.len() {
-                    supported_order.push(*col_name);
-                }
-            }
+        &order[..i]
+    }
 
-            for i in query.range.len()..query.select {
-                let col_name = &index.columns()[i];
+    fn supported_range<S>(
+        &self,
+        schema: &'a TableSchema<S>,
+        range: &HashMap<K, ColumnRange<S::Value>>,
+    ) -> Columns<K>
+    where
+        S: Schema<Id = K>,
+    {
+        let mut columns = Columns::with_capacity(schema.primary().len());
 
-                if supported_order.len() < order.len() && !supported_order.contains(&col_name) {
-                    supported_order.push(col_name);
+        for (index_id, query) in &self.indices {
+            debug_assert!(query.select >= query.range.len());
+
+            let index = schema.get_index(*index_id).expect("index");
+
+            for col_name in &index.columns()[..query.select] {
+                if let Some(col_range) = range.get(col_name) {
+                    if !columns.contains(&col_name) {
+                        columns.push(col_name);
+                    }
+
+                    if col_range.is_range() {
+                        break;
+                    }
                 }
             }
         }
 
-        println!(
-            "{self:?} supports range columns {supported_range:?} and order {supported_order:?}"
-        );
-
-        range.len() == supported_range.len() && order.len() == supported_order.len()
+        columns
     }
 }
 
