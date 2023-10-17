@@ -511,84 +511,19 @@ where
             )
         })?;
 
-        let mut keys: b_tree::Keys<S::Value> = Box::pin(futures::stream::empty());
-        let mut index_columns = Option::<&[S::Id]>::None;
+        let keys: b_tree::Keys<S::Value> = Box::pin(futures::stream::empty());
+        let index_columns = Option::<&[S::Id]>::None;
 
-        while let Some((index_id, index_query)) = plan.indices.pop() {
-            let index = self.get_index(index_id).expect("index");
+        // if there is only one index, construct a stream over its keys with the given range
+        // otherwise:
+        //  construct a stream over the unique prefixes in the first index
+        //  for each index before the last, merge all unique prefixes beginning with each prefix
+        //  merge streams of all keys in the last index beginning with each prefix
 
-            // construct the range by subtracting from the global range
-            let index_range = index_range_for(&index_query.range, &mut range);
+        // if all columns to select are already present, return the stream
+        // otherwise, construct a stream of rows by extracting & selecting each primary key
 
-            // construct a stream of keys in the index
-            keys = if let Some(columns_in) = index_columns {
-                let columns = index.schema().columns();
-                debug_assert!(index_query.select <= columns.len());
-
-                let column_range = columns
-                    .get(index_query.select)
-                    .and_then(|col_name| range.remove(col_name));
-
-                let columns_out = &columns[..index_query.select];
-                let extractor =
-                    prefix_extractor(&columns_in.iter().collect::<Key<&S::Id>>(), columns_out);
-
-                let index = index.clone();
-                let keys = keys
-                    .map_ok(extractor)
-                    .map_ok(move |prefix| inner_range(prefix, column_range.clone()))
-                    .map_ok(move |range| index.clone().keys(range, reverse))
-                    .try_buffered(num_cpus::get())
-                    .try_flatten();
-
-                Box::pin(keys)
-            } else {
-                index.clone().keys(index_range, reverse).await?
-            };
-
-            index_columns = Some(index.schema().columns());
-        }
-
-        let (columns, keys) = match (index_columns, keys) {
-            (Some(columns), keys) => (columns, keys),
-            (None, _) => {
-                let columns = self.schema.primary().columns();
-                let range = index_range_for(&columns.iter().collect::<Key<&S::Id>>(), &mut range);
-                let keys = self.primary.clone().keys(range, reverse).await?;
-                (columns, keys)
-            }
-        };
-
-        assert!(range.is_empty());
-
-        let select = select.unwrap_or(self.schema.primary().columns());
-
-        if select.iter().all(|col_name| columns.contains(col_name)) {
-            // if the merged index stream contains all the selected columns, return it
-            let columns: Key<&S::Id> = columns.iter().collect();
-            let extractor = prefix_extractor(&columns, select);
-            let rows = keys.map_ok(extractor);
-            Ok(Box::pin(rows))
-        } else {
-            // otherwise, extract the primary key from each key in the stream
-            // and select it from the primary index
-
-            let columns: Key<&S::Id> = columns.iter().collect();
-            let extractor = prefix_extractor(&columns, self.schema.key());
-
-            let primary = self.primary.clone();
-            let rows = keys
-                .map_ok(extractor)
-                .map_ok(move |key| {
-                    let key = key.into();
-                    let primary = primary.clone();
-                    async move { primary.first(&key).await }
-                })
-                .try_buffered(num_cpus::get())
-                .map_ok(|maybe_key| maybe_key.expect("row"));
-
-            Ok(Box::pin(rows))
-        }
+        todo!()
     }
 
     /// Consume this [`TableReadGuard`] to construct a [`Stream`] of all the rows in the [`Table`].
