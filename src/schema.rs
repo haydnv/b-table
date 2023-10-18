@@ -312,15 +312,34 @@ pub(crate) enum IndexQuery<'a, K> {
     Range(Columns<'a, K>),
     Order(&'a [K]),
     RangeAndOrder(Columns<'a, K>, &'a [K]),
+    Scan(&'a [K], Columns<'a, K>, &'a [K]),
 }
 
-impl<'a, K> IndexQuery<'a, K> {
+impl<'a, K: Eq> IndexQuery<'a, K> {
+    #[inline]
+    pub fn is_scan(&self) -> bool {
+        match self {
+            Self::Scan(_, _, _) => true,
+            _ => false,
+        }
+    }
+    #[inline]
+    pub fn order(&self) -> &'a [K] {
+        match self {
+            Self::Range(_range) => &[],
+            Self::Order(order) => order,
+            Self::RangeAndOrder(_range, order) => order,
+            Self::Scan(_columns, _range, order) => order,
+        }
+    }
+
     #[inline]
     pub fn range(&self) -> Columns<'a, K> {
         match self {
             Self::Range(range) => Columns::from_slice(range),
             Self::Order(_order) => Columns::default(),
             Self::RangeAndOrder(range, _order) => Columns::from_slice(range),
+            Self::Scan(_columns, range, _order) => Columns::from_slice(range),
         }
     }
 
@@ -328,14 +347,15 @@ impl<'a, K> IndexQuery<'a, K> {
     pub fn selected(&self, prefix_len: usize) -> usize {
         match self {
             Self::Range(range) => prefix_len + range.len(),
-            Self::Order(order) => {
-                debug_assert!(prefix_len < order.len());
-                order.len()
-            }
-            Self::RangeAndOrder(range, order) => {
-                debug_assert!(range.len() < order.len());
-                debug_assert!(prefix_len < order.len());
-                order.len()
+            Self::Order(order) => order.len(),
+            Self::RangeAndOrder(range, order) => order.len(),
+            Self::Scan(columns, range, order) => {
+                debug_assert!(range.iter().all(|c| columns.contains(c)));
+                debug_assert!((0..columns.len() - order.len())
+                    .into_iter()
+                    .any(|i| &columns[i..i + order.len()] == *order));
+
+                columns.len()
             }
         }
     }
@@ -345,12 +365,7 @@ impl<'a, K: fmt::Debug> fmt::Debug for IndexQuery<'a, K> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Range(columns) => {
-                write!(
-                    f,
-                    "query {} column(s) with a range over {:?}",
-                    columns.len(),
-                    columns
-                )
+                write!(f, "query with a range over {columns:?}")
             }
             Self::Order(order) => {
                 write!(f, "query {} column(s)", order.len())
@@ -363,6 +378,10 @@ impl<'a, K: fmt::Debug> fmt::Debug for IndexQuery<'a, K> {
                     range
                 )
             }
+            Self::Scan(_columns, range, order) => write!(
+                f,
+                "index scan to filter by range {range:?} with order {order:?}"
+            ),
         }
     }
 }
@@ -417,8 +436,8 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
 
         // first, create a list of all candidates which cover the requested order (if any)
         while let Some(candidate) = unvisited.pop_front() {
-            let supported_order = candidate.supported_order(schema, order);
-            let supported_range = candidate.supported_range(schema, range);
+            let supported_order = candidate.supported_order(order);
+            let supported_range = candidate.supported_range();
             let selected = candidate.selected(schema);
 
             debug_assert!(order.starts_with(supported_order));
@@ -426,8 +445,18 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
             for index_id in schema.index_ids() {
                 let index = schema.get_index(index_id).expect("index");
 
-                if index.columns().starts_with(selected) {
-                    let candidates = candidate.needs(
+                let starts_with_selected = if index.columns().len() > selected.len() {
+                    index
+                        .columns()
+                        .iter()
+                        .take(selected.len())
+                        .all(|col_name| selected.contains(col_name))
+                } else {
+                    false
+                };
+
+                if starts_with_selected {
+                    let candidates = candidate.needs_order(
                         schema,
                         index_id,
                         selected,
@@ -438,8 +467,16 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
                     );
 
                     unvisited.extend(candidates);
-                } else {
-                    // TODO
+                } else if let Some(candidate) = candidate.needs_scan(
+                    schema,
+                    index_id,
+                    selected,
+                    &supported_range,
+                    supported_order,
+                    range,
+                    order,
+                ) {
+                    unvisited.push_back(candidate);
                 }
             }
 
@@ -451,12 +488,12 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
         // then winnow down to only candidates which support the largest portion of the range
         let max_supported_range = candidates
             .iter()
-            .map(|candidate| candidate.supported_range(schema, range).len())
+            .map(|candidate| candidate.supported_range().len())
             .fold(0, Ord::max);
 
         // then winnow by candidate size (number of indices to query)
         while let Some(candidate) = candidates.pop() {
-            if candidate.supported_range(schema, range).len() == max_supported_range {
+            if candidate.supported_range().len() == max_supported_range {
                 return Some(candidate);
             }
         }
@@ -470,7 +507,7 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
         clone
     }
 
-    fn needs<S>(
+    fn needs_order<S>(
         &self,
         schema: &'a TableSchema<S>,
         index_id: IndexId<'a>,
@@ -483,10 +520,17 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
     where
         S: Schema<Id = K>,
     {
-        debug_assert_eq!(*supported_range, self.supported_range(schema, range));
-        debug_assert_eq!(supported_order, self.supported_order(schema, order));
+        debug_assert_eq!(*supported_range, self.supported_range());
+        debug_assert_eq!(supported_order, self.supported_order(order));
 
         let index = schema.get_index(index_id).expect("index");
+
+        debug_assert!(
+            selected.len() <= index.columns().len(),
+            "selection {selected:?} > index {:?}",
+            index.columns()
+        );
+
         let mut unvisited = IndexStack::with_capacity(Ord::min(INDEX_STACK_SIZE, index.len() + 2));
 
         let mut covered_range = Columns::with_capacity(index.len());
@@ -510,39 +554,102 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
             }
         }
 
-        if supported_order.len() < order.len() {
-            let covered_order = index
+        let covered_order = if supported_order.len() < order.len() {
+            index
                 .columns()
                 .iter()
                 .skip(selected.len())
                 .zip(&order[supported_order.len()..])
                 .take_while(|(ic, oc)| ic == oc)
-                .count();
+                .count()
+        } else {
+            0
+        };
 
-            if covered_order > 0 {
-                for co in 1..covered_order {
-                    let index_order = &index.columns()[..selected.len() + co];
-                    let query = IndexQuery::Order(index_order);
-                    unvisited.push(self.clone_and_push(index_id, query));
-                }
+        for co in 1..(covered_order + 1) {
+            let index_order = &index.columns()[selected.len()..selected.len() + co];
 
-                if !covered_range.is_empty() && covered_range.len() < covered_order {
-                    let index_order = &index.columns()[..selected.len() + covered_order];
-                    let covered_range = Columns::from_slice(&covered_range);
-                    let query = IndexQuery::RangeAndOrder(covered_range, index_order);
-                    let candidate = self.clone_and_push(index_id, query);
-                    unvisited.push(candidate);
-                }
+            if !covered_range.is_empty() && co >= covered_range.len() {
+                debug_assert!(covered_range.iter().all(|c| index_order.contains(c)));
+                let covered_range = Columns::from_slice(&covered_range);
+                let query = IndexQuery::RangeAndOrder(covered_range, index_order);
+                unvisited.push(self.clone_and_push(index_id, query));
+            } else {
+                let query = IndexQuery::Order(index_order);
+                unvisited.push(self.clone_and_push(index_id, query));
             }
         }
 
-        if !covered_range.is_empty() {
+        if covered_order == 0 && !covered_range.is_empty() {
             let query = IndexQuery::Range(covered_range);
             let candidate = self.clone_and_push(index_id, query);
             unvisited.push(candidate);
         }
 
         unvisited
+    }
+
+    fn needs_scan<S>(
+        &self,
+        schema: &'a TableSchema<S>,
+        index_id: IndexId<'a>,
+        selected: &'a [K],
+        supported_range: &Columns<'a, K>,
+        supported_order: &'a [K],
+        range: &HashMap<K, ColumnRange<S::Value>>,
+        order: &'a [K],
+    ) -> Option<Self>
+    where
+        S: Schema<Id = K>,
+    {
+        let index = schema.get_index(index_id).expect("index");
+
+        if index.columns().len() < selected.len() {
+            None
+        } else if !selected
+            .iter()
+            .all(|col_name| index.columns().contains(col_name))
+        {
+            None
+        } else if self
+            .indices
+            .iter()
+            .any(|(id, query)| id == &index_id && query.is_scan())
+        {
+            None
+        } else {
+            let uncovered_order = &order[supported_order.len()..];
+            debug_assert!(!uncovered_order.iter().any(|c| selected.contains(c)));
+
+            let covered_order = if uncovered_order.is_empty() {
+                0
+            } else {
+                index
+                    .columns()
+                    .iter()
+                    .skip_while(|c| *c != &uncovered_order[0])
+                    .zip(uncovered_order)
+                    .take_while(|(c, u)| c == u)
+                    .count()
+            };
+
+            let covered_order =
+                &order[supported_order.len()..supported_order.len() + covered_order];
+
+            let covered_range = index
+                .columns()
+                .iter()
+                .filter(|c| !supported_range.contains(c))
+                .filter(|c| range.contains_key(c))
+                .collect::<Columns<_>>();
+
+            if covered_range.is_empty() && covered_order.is_empty() {
+                None
+            } else {
+                let query = IndexQuery::Scan(index.columns(), covered_range, covered_order);
+                Some(self.clone_and_push(index_id, query))
+            }
+        }
     }
 
     fn selected<'b, S>(&self, schema: &'b TableSchema<S>) -> &'b [K]
@@ -560,46 +667,25 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
         selected
     }
 
-    fn supported_order<S>(&self, schema: &TableSchema<S>, order: &'a [K]) -> &'a [K]
-    where
-        S: Schema<Id = K>,
-    {
+    fn supported_order(&self, order: &'a [K]) -> &'a [K] {
         let mut i = 0;
-        let mut selected = &schema.primary().columns()[..0];
 
-        for (index_id, query) in &self.indices {
-            let index = schema.get_index(*index_id).expect("index");
-
-            let offset = selected.len();
-
-            i += order
-                .iter()
-                .skip(i)
-                .zip(&index.columns()[offset..query.selected(offset)])
-                .take_while(|(o, c)| o == c)
-                .count();
-
-            selected = &index.columns()[..query.selected(offset)];
+        for (_index_id, query) in &self.indices {
+            let index_order = query.order();
+            debug_assert_eq!(&order[i..i + index_order.len()], index_order, "index order {index_order:?} does not match order {order:?} with {:?} already supported", &order[..i]);
+            i += index_order.len();
         }
 
         &order[..i]
     }
 
-    fn supported_range<'b, S>(
-        &self,
-        schema: &'b TableSchema<S>,
-        range: &HashMap<K, ColumnRange<S::Value>>,
-    ) -> Columns<'b, K>
+    fn supported_range<'b>(&self) -> Columns<'b, K>
     where
-        S: Schema<Id = K>,
         'a: 'b,
     {
-        let mut columns = Columns::with_capacity(schema.primary().len());
-        let mut selected = &schema.primary().columns()[..0];
+        let mut columns = Columns::with_capacity(ROW_STACK_SIZE);
 
-        for (index_id, query) in &self.indices {
-            let index = schema.get_index(*index_id).expect("index");
-
+        for (_index_id, query) in &self.indices {
             for col_name in query.range() {
                 debug_assert!(
                     !columns.contains(&col_name),
@@ -608,8 +694,6 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
 
                 columns.push(col_name);
             }
-
-            selected = &index.columns()[..query.selected(selected.len())];
         }
 
         columns
@@ -874,18 +958,44 @@ mod test {
         let actual = QueryPlan::new(&schema, &range, &[]).expect("plan");
         assert_eq!(expected, actual);
 
+        let expected = QueryPlan {
+            indices: smallvec![
+                (
+                    IndexId::Primary,
+                    IndexQuery::RangeAndOrder(smallvec![&"0"], &["0"])
+                ),
+                (IndexId::Primary, IndexQuery::Range(smallvec![&"1"])),
+            ],
+        };
+
         let actual = QueryPlan::new(&schema, &range, &["0"]).expect("plan");
         assert_eq!(expected, actual);
+
+        let expected = QueryPlan {
+            indices: smallvec![
+                (
+                    IndexId::Primary,
+                    IndexQuery::RangeAndOrder(smallvec![&"0"], &["0"])
+                ),
+                (
+                    IndexId::Primary,
+                    IndexQuery::RangeAndOrder(smallvec![&"1"], &["1"])
+                ),
+            ],
+        };
 
         let actual = QueryPlan::new(&schema, &range, &["0", "1"]).expect("plan");
         assert_eq!(expected, actual);
 
         let expected = QueryPlan {
             indices: smallvec![
-                (IndexId::Primary, IndexQuery::Range(smallvec![&"0"])),
                 (
                     IndexId::Primary,
-                    IndexQuery::RangeAndOrder(smallvec![&"1"], &["0", "1", "2"]),
+                    IndexQuery::RangeAndOrder(smallvec![&"0"], &["0"])
+                ),
+                (
+                    IndexId::Primary,
+                    IndexQuery::RangeAndOrder(smallvec![&"1"], &["1", "2"]),
                 ),
             ],
         };
@@ -895,10 +1005,13 @@ mod test {
 
         let expected = QueryPlan {
             indices: smallvec![
-                (IndexId::Primary, IndexQuery::Range(smallvec![&"0"])),
                 (
                     IndexId::Primary,
-                    IndexQuery::RangeAndOrder(smallvec![&"1"], &["0", "1", "2", "3"]),
+                    IndexQuery::RangeAndOrder(smallvec![&"0"], &["0"])
+                ),
+                (
+                    IndexId::Primary,
+                    IndexQuery::RangeAndOrder(smallvec![&"1"], &["1", "2", "3"]),
                 ),
             ],
         };
@@ -921,7 +1034,7 @@ mod test {
             )],
         };
 
-        let schema = schema.into();
+        let schema = TableSchema::from(schema);
 
         let mut range = HashMap::new();
         range.insert("1", (2..3).into());
@@ -932,6 +1045,13 @@ mod test {
 
         let actual = QueryPlan::new(&schema, &range, &[]).expect("plan");
         assert_eq!(expected, actual);
+
+        let expected = QueryPlan {
+            indices: smallvec![(
+                IndexId::Auxiliary("1"),
+                IndexQuery::RangeAndOrder(smallvec![&"1"], &["1"]),
+            )],
+        };
 
         let actual = QueryPlan::new(&schema, &range, &["1"]).expect("plan");
         assert_eq!(expected, actual);
@@ -949,7 +1069,10 @@ mod test {
         let expected = QueryPlan {
             indices: smallvec![
                 (IndexId::Primary, IndexQuery::Order(&["0"]),),
-                (IndexId::Primary, IndexQuery::Range(smallvec![&"1"]),)
+                (
+                    IndexId::Primary,
+                    IndexQuery::RangeAndOrder(smallvec![&"1"], &["1"]),
+                )
             ],
         };
 
@@ -982,7 +1105,7 @@ mod test {
             ],
         };
 
-        let schema = schema.into();
+        let schema = TableSchema::from(schema);
 
         let mut range = HashMap::new();
         range.insert("1", (1..2).into());
@@ -1004,16 +1127,19 @@ mod test {
         let actual = QueryPlan::new(&schema, &range, &[]).expect("plan");
         assert_eq!(expected, actual);
 
-        // let range = HashMap::default();
-        //
-        // let expected = QueryPlan {
-        //     indices: smallvec![
-        //         (IndexId::Auxiliary("1"), IndexQuery::Order(&["1"]),),
-        //         (IndexId::Primary, IndexQuery::Scan,),
-        //     ],
-        // };
-        //
-        // let actual = QueryPlan::new(&schema, &range, &["1", "2"]).expect("plan");
-        // assert_eq!(expected, actual);
+        let range = HashMap::default();
+
+        let expected = QueryPlan {
+            indices: smallvec![
+                (IndexId::Auxiliary("1"), IndexQuery::Order(&["1"]),),
+                (
+                    IndexId::Primary,
+                    IndexQuery::Scan(schema.primary.columns(), smallvec![], &["2"]),
+                ),
+            ],
+        };
+
+        let actual = QueryPlan::new(&schema, &range, &["1", "2"]).expect("plan");
+        assert_eq!(expected, actual);
     }
 }
