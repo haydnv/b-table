@@ -2,6 +2,7 @@ pub use b_tree::{collate, Collator};
 pub use schema::*;
 pub use table::*;
 
+mod plan;
 mod schema;
 #[cfg(feature = "stream")]
 mod stream;

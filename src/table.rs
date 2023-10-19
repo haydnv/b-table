@@ -13,6 +13,7 @@ use futures::try_join;
 use safecast::AsType;
 use smallvec::SmallVec;
 
+use super::plan::QueryPlan;
 use super::schema::*;
 use super::{IndexStack, Node};
 
@@ -78,6 +79,15 @@ where
     /// Create a new [`Table`]
     pub fn create(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
         for (index_name, index) in schema.auxiliary() {
+            for col_name in index.columns() {
+                if !schema.primary().columns().contains(col_name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("index {index_name} refers to unknown column {col_name}"),
+                    ));
+                }
+            }
+
             for col_name in schema.key() {
                 if !index.columns().contains(col_name) {
                     return Err(io::Error::new(
