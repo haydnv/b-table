@@ -570,8 +570,7 @@ where
                     .map_ok(extract_prefix)
                     .map_ok(move |primary_key| {
                         let index = index.clone();
-
-                        async move { index.first(&primary_key.into()).await }
+                        async move { index.first(b_tree::Range::from(primary_key)).await }
                     })
                     .try_buffered(num_cpus::get())
                     .map_ok(|maybe_row| maybe_row.expect("row"));
