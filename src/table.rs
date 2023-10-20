@@ -13,7 +13,7 @@ use futures::try_join;
 use safecast::AsType;
 use smallvec::SmallVec;
 
-use super::plan::QueryPlan;
+use super::plan::{IndexQuery, QueryPlan};
 use super::schema::*;
 use super::{IndexStack, Node};
 
@@ -502,12 +502,12 @@ where
     }
 
     /// Construct a [`Stream`] of the `select`ed columns of the [`Rows`] within the given `range`.
-    pub async fn rows(
-        &self,
+    pub async fn rows<'a>(
+        &'a self,
         range: Range<S::Id, S::Value>,
-        order: &[S::Id],
+        order: &'a [S::Id],
         reverse: bool,
-        select: Option<&[S::Id]>,
+        select: Option<&'a [S::Id]>,
     ) -> Result<Rows<S::Value>, io::Error> {
         #[cfg(feature = "logging")]
         log::debug!("Table::rows with order {order:?}");
@@ -521,34 +521,116 @@ where
             )
         })?;
 
-        let mut keys: Option<(b_tree::Keys<S::Value>, &[S::Id])> = None;
+        let mut keys: Option<(b_tree::Keys<S::Value>, &'a [S::Id])> = None;
 
         let last_query = plan.indices.pop();
 
         if let Some((index_id, query)) = plan.indices.first() {
-            // if there is only one index, construct a stream over its keys with the given range
-            // otherwise, construct a stream over the unique prefixes in the first index
-            todo!()
+            let index = self.get_index(*index_id).expect("index");
+
+            keys = if plan.indices.len() == 1 {
+                // if this is the only index to query, construct a stream of all keys in range
+                let columns = index.schema().columns();
+
+                let index_range = index_range_for(columns, &mut range);
+                assert!(range.is_empty());
+
+                let index_keys = index.clone().keys(index_range, reverse).await?;
+
+                Some((index_keys, columns))
+            } else {
+                // otherwise, construct a stream over the unique prefixes in the first index
+                let columns = &index.schema().columns()[..query.selected(0)];
+                assert!(query.range().iter().zip(columns).all(|(r, c)| *r == c));
+
+                let index_range = index_range_for(&columns[..query.range().len()], &mut range);
+                let index_prefixes = index
+                    .clone()
+                    .groups(index_range, columns.len(), reverse)
+                    .await?;
+
+                Some((index_prefixes, columns))
+            }
         }
 
         // for each index before the last
-        for query in plan.indices.into_iter().skip(1) {
+        for (index_id, query) in plan.indices.into_iter().skip(1) {
             // merge all unique prefixes beginning with each prefix
-            todo!()
+
+            let index = self.get_index(index_id).expect("index");
+
+            let (prefixes, columns_in) = keys.take().expect("prefixes");
+
+            let columns_out = &index.schema().columns()[..query.selected(columns_in.len())];
+
+            debug_assert!(columns_out.len() > columns_in.len());
+            debug_assert!(columns_out
+                .iter()
+                .take(columns_in.len())
+                .all(|c| columns_in.contains(c)));
+
+            assert!(query.range().iter().zip(columns_out).all(|(r, c)| *r == c));
+
+            let extract_prefix = prefix_extractor(columns_in, &columns_out[..columns_in.len()]);
+
+            let inner_range = inner_range_for(&query, &range);
+
+            let n = columns_out.len();
+            let index = index.clone();
+
+            let index_prefixes = prefixes
+                .map_ok(extract_prefix)
+                .map_ok(move |prefix| inner_range.clone().prepend(prefix))
+                .map_ok(move |index_range| {
+                    let index = index.clone();
+                    async move { index.groups(index_range, n, reverse).await }
+                })
+                .try_buffered(num_cpus::get())
+                .try_flatten();
+
+            keys = Some((Box::pin(index_prefixes), columns_out))
         }
 
         if let Some((index_id, query)) = last_query {
-            if let Some((keys, columns)) = keys.take() {
+            if let Some((prefixes, columns_in)) = keys.take() {
                 // merge streams of all keys in the last index beginning with each prefix
-                todo!()
+
+                let index = self.get_index(index_id).expect("index");
+
+                let columns_out = &index.schema().columns();
+
+                debug_assert!(columns_out.len() > columns_in.len());
+                debug_assert!(columns_out
+                    .iter()
+                    .take(columns_in.len())
+                    .all(|c| columns_in.contains(c)));
+
+                let extract_prefix = prefix_extractor(columns_in, &columns_out[..columns_in.len()]);
+
+                let inner_range = inner_range_for(&query, &range);
+
+                let index = index.clone();
+
+                let index_keys = prefixes
+                    .map_ok(extract_prefix)
+                    .map_ok(move |prefix| inner_range.clone().prepend(prefix))
+                    .map_ok(move |index_range| {
+                        let index = index.clone();
+                        async move { index.keys(index_range, reverse).await }
+                    })
+                    .try_buffered(num_cpus::get())
+                    .try_flatten();
+
+                keys = Some((Box::pin(index_keys), columns_out))
             } else {
                 let index = self.get_index(index_id).expect("index");
-                let index_range = index_range_for(index.schema().columns(), &mut range);
+                let columns = index.schema().columns();
+
+                let index_range = index_range_for(columns, &mut range);
                 assert!(range.is_empty());
 
-                let index_columns = index.schema().columns();
                 let index_keys = index.clone().keys(index_range, reverse).await?;
-                keys = Some((Box::pin(index_keys), index_columns));
+                keys = Some((Box::pin(index_keys), columns));
             }
         }
 
@@ -557,7 +639,14 @@ where
         if let Some((keys, columns)) = keys {
             if select.iter().all(|c| columns.contains(c)) {
                 // if all columns to select are already present, return the stream
-                todo!()
+
+                if columns == select {
+                    Ok(keys)
+                } else {
+                    let extract_prefix = prefix_extractor(columns, select);
+                    let rows = keys.map_ok(extract_prefix);
+                    Ok(Box::pin(rows))
+                }
             } else {
                 // otherwise, construct a stream of rows by extracting & selecting each primary key
 
@@ -577,12 +666,21 @@ where
 
                 Ok(Box::pin(rows))
             }
-        } else if select == self.schema.primary().columns() {
-            let index_range = index_range_for(self.schema.primary().columns(), &mut range);
-            assert!(range.is_empty());
-            self.primary.clone().keys(index_range, reverse).await
         } else {
-            todo!()
+            let columns = self.schema.primary().columns();
+            let index_range = index_range_for(columns, &mut range);
+
+            assert!(range.is_empty());
+
+            let keys = self.primary.clone().keys(index_range, reverse).await?;
+
+            if select == self.schema.primary().columns() {
+                Ok(keys)
+            } else {
+                let extract_prefix = prefix_extractor(columns, select);
+                let rows = keys.map_ok(extract_prefix);
+                Ok(Box::pin(rows))
+            }
         }
     }
 
@@ -625,18 +723,31 @@ fn index_range_for<K: Eq + Hash, V>(
 }
 
 #[inline]
-fn inner_range<V>(mut prefix: Key<V>, column_range: Option<ColumnRange<V>>) -> b_tree::Range<V> {
-    if let Some(column_range) = column_range {
-        match column_range {
-            ColumnRange::Eq(value) => {
-                prefix.push(value);
-                b_tree::Range::from_prefix(prefix)
+fn inner_range_for<'a, K, V>(
+    query: &IndexQuery<'a, K>,
+    range: &HashMap<K, ColumnRange<V>>,
+) -> b_tree::Range<V>
+where
+    K: Eq + Hash,
+    V: Clone,
+{
+    let mut inner_range = Key::with_capacity(query.range().len());
+    let mut range_columns = query.range().into_iter();
+
+    let inner_range = loop {
+        if let Some(col_name) = range_columns.next() {
+            match range.get(col_name).cloned().expect("column range") {
+                ColumnRange::Eq(value) => inner_range.push(value),
+                ColumnRange::In(bounds) => break b_tree::Range::with_bounds(inner_range, bounds),
             }
-            ColumnRange::In(bounds) => b_tree::Range::with_bounds(prefix, bounds),
+        } else {
+            break b_tree::Range::from(inner_range);
         }
-    } else {
-        b_tree::Range::from_prefix(prefix)
-    }
+    };
+
+    assert!(range_columns.next().is_none());
+
+    inner_range
 }
 
 fn prefix_extractor<K, V>(columns_in: &[K], columns_out: &[K]) -> impl Fn(Key<V>) -> Key<V> + Send
