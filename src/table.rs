@@ -429,7 +429,7 @@ where
     }
 
     /// Look up a row by its `key`.
-    pub async fn get_row<K: Into<b_tree::Key<S::Value>>>(
+    pub async fn get_row<K: Into<Key<S::Value>>>(
         &self,
         key: K,
     ) -> Result<Option<Row<S::Value>>, io::Error> {
@@ -444,7 +444,7 @@ where
     }
 
     /// Look up a value by its `key`.
-    pub async fn get_value<K: Into<b_tree::Key<S::Value>>>(
+    pub async fn get_value<K: Into<Key<S::Value>>>(
         &self,
         key: K,
     ) -> Result<Option<Row<S::Value>>, io::Error> {
@@ -521,19 +521,70 @@ where
             )
         })?;
 
-        let keys: b_tree::Keys<S::Value> = Box::pin(futures::stream::empty());
-        let index_columns = Option::<&[S::Id]>::None;
+        let mut keys: Option<(b_tree::Keys<S::Value>, &[S::Id])> = None;
 
-        // if there is only one index, construct a stream over its keys with the given range
-        // otherwise:
-        //  construct a stream over the unique prefixes in the first index
-        //  for each index before the last, merge all unique prefixes beginning with each prefix
-        //  merge streams of all keys in the last index beginning with each prefix
+        let last_query = plan.indices.pop();
 
-        // if all columns to select are already present, return the stream
-        // otherwise, construct a stream of rows by extracting & selecting each primary key
+        if let Some((index_id, query)) = plan.indices.first() {
+            // if there is only one index, construct a stream over its keys with the given range
+            // otherwise, construct a stream over the unique prefixes in the first index
+            todo!()
+        }
 
-        todo!()
+        // for each index before the last
+        for query in plan.indices.into_iter().skip(1) {
+            // merge all unique prefixes beginning with each prefix
+            todo!()
+        }
+
+        if let Some((index_id, query)) = last_query {
+            if let Some((keys, columns)) = keys.take() {
+                // merge streams of all keys in the last index beginning with each prefix
+                todo!()
+            } else {
+                let index = self.get_index(index_id).expect("index");
+                let index_range = index_range_for(index.schema().columns(), &mut range);
+                assert!(range.is_empty());
+
+                let index_columns = index.schema().columns();
+                let index_keys = index.clone().keys(index_range, reverse).await?;
+                keys = Some((Box::pin(index_keys), index_columns));
+            }
+        }
+
+        let select = select.unwrap_or(self.schema.primary().columns());
+
+        if let Some((keys, columns)) = keys {
+            if select.iter().all(|c| columns.contains(c)) {
+                // if all columns to select are already present, return the stream
+                todo!()
+            } else {
+                // otherwise, construct a stream of rows by extracting & selecting each primary key
+
+                assert!(self.schema.key().iter().all(|c| columns.contains(c)));
+
+                let index = self.primary.clone();
+                let extract_prefix = prefix_extractor(columns, self.schema.key());
+
+                let rows = keys
+                    .map_ok(extract_prefix)
+                    .map_ok(move |primary_key| {
+                        let index = index.clone();
+
+                        async move { index.first(&primary_key.into()).await }
+                    })
+                    .try_buffered(num_cpus::get())
+                    .map_ok(|maybe_row| maybe_row.expect("row"));
+
+                Ok(Box::pin(rows))
+            }
+        } else if select == self.schema.primary().columns() {
+            let index_range = index_range_for(self.schema.primary().columns(), &mut range);
+            assert!(range.is_empty());
+            self.primary.clone().keys(index_range, reverse).await
+        } else {
+            todo!()
+        }
     }
 
     /// Consume this [`TableReadGuard`] to construct a [`Stream`] of all the rows in the [`Table`].
@@ -551,10 +602,10 @@ impl<S: fmt::Debug, IS, C, G> fmt::Debug for Table<S, IS, C, G> {
 
 #[inline]
 fn index_range_for<K: Eq + Hash, V>(
-    columns: &[&K],
+    columns: &[K],
     range: &mut HashMap<K, ColumnRange<V>>,
 ) -> b_tree::Range<V> {
-    let mut prefix = b_tree::Key::with_capacity(range.len());
+    let mut prefix = Key::with_capacity(range.len());
 
     for col_name in columns {
         if let Some(col_range) = range.remove(col_name) {
@@ -566,6 +617,8 @@ fn index_range_for<K: Eq + Hash, V>(
                     return b_tree::Range::with_bounds(prefix, bounds);
                 }
             }
+        } else {
+            break;
         }
     }
 
@@ -573,10 +626,7 @@ fn index_range_for<K: Eq + Hash, V>(
 }
 
 #[inline]
-fn inner_range<V>(
-    mut prefix: b_tree::Key<V>,
-    column_range: Option<ColumnRange<V>>,
-) -> b_tree::Range<V> {
+fn inner_range<V>(mut prefix: Key<V>, column_range: Option<ColumnRange<V>>) -> b_tree::Range<V> {
     if let Some(column_range) = column_range {
         match column_range {
             ColumnRange::Eq(value) => {
@@ -590,10 +640,7 @@ fn inner_range<V>(
     }
 }
 
-fn prefix_extractor<K, V>(
-    columns_in: &[&K],
-    columns_out: &[K],
-) -> Box<dyn Fn(Key<V>) -> Key<V> + Send>
+fn prefix_extractor<K, V>(columns_in: &[K], columns_out: &[K]) -> impl Fn(Key<V>) -> Key<V> + Send
 where
     K: PartialEq + fmt::Debug,
 {
@@ -607,22 +654,12 @@ where
     #[cfg(feature = "logging")]
     log::trace!("extract columns {columns_out:?} from {columns_in:?}");
 
-    if columns_in.len()
-        == columns_in
-            .iter()
-            .zip(columns_out)
-            .filter(|(i, o)| *i == o)
-            .count()
-    {
-        return Box::new(|key| key);
-    }
-
     let mut indices = IndexStack::with_capacity(columns_out.len());
 
     for name_out in columns_out {
         let mut index = columns_in
             .iter()
-            .position(|name_in| *name_in == name_out)
+            .position(|name_in| name_in == name_out)
             .expect("index");
 
         index -= indices.iter().copied().filter(|i| *i < index).count();
@@ -630,15 +667,15 @@ where
         indices.push(index);
     }
 
-    Box::new(move |mut key| {
-        let mut prefix = b_tree::Key::with_capacity(indices.len() + 1);
+    move |mut key| {
+        let mut prefix = Key::with_capacity(indices.len() + 1);
 
         for i in indices.iter().copied() {
             prefix.push(key.remove(i));
         }
 
         prefix
-    })
+    }
 }
 
 impl<S, IS, C, FE> Table<S, IS, C, DirWriteGuardOwned<FE>> {
@@ -666,7 +703,7 @@ where
 {
     /// Delete a row from this [`Table`] by its `key`.
     /// Returns `true` if the given `key` was present.
-    pub async fn delete_row(&mut self, key: b_tree::Key<S::Value>) -> Result<bool, S::Error> {
+    pub async fn delete_row(&mut self, key: Key<S::Value>) -> Result<bool, S::Error> {
         let row = if let Some(row) = self.get_row(key).await? {
             row
         } else {

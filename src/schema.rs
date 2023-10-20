@@ -343,18 +343,6 @@ impl<S: Schema> TableSchema<S> {
 
         iter::once(IndexId::Primary).chain(aux)
     }
-
-    pub fn indices(&self) -> impl Iterator<Item = (IndexId, &S::Index)> {
-        let primary = (IndexId::Primary, self.inner.primary());
-
-        let aux = self
-            .inner
-            .auxiliary()
-            .iter()
-            .map(|(name, index)| (name.into(), index));
-
-        iter::once(primary).chain(aux)
-    }
 }
 
 impl<S> Deref for TableSchema<S> {
