@@ -7,9 +7,8 @@ use std::{fmt, io};
 use b_tree::collate::Collate;
 use b_tree::{BTree, BTreeLock, Key};
 use freqfs::{DirDeref, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad};
-use futures::future::{Future, TryFutureExt};
+use futures::future::{try_join_all, TryFutureExt};
 use futures::stream::{Stream, TryStreamExt};
-use futures::try_join;
 use safecast::AsType;
 use smallvec::SmallVec;
 
@@ -205,8 +204,7 @@ where
 
         Table {
             schema,
-            primary,
-            auxiliary,
+            state: TableState { primary, auxiliary },
         }
     }
 
@@ -236,8 +234,7 @@ where
 
         Table {
             schema,
-            primary,
-            auxiliary,
+            state: TableState { primary, auxiliary },
         }
     }
 
@@ -266,8 +263,7 @@ where
 
         Ok(Table {
             schema,
-            primary,
-            auxiliary,
+            state: TableState { primary, auxiliary },
         })
     }
 
@@ -296,8 +292,7 @@ where
 
         Table {
             schema,
-            primary,
-            auxiliary,
+            state: TableState { primary, auxiliary },
         }
     }
 
@@ -327,8 +322,7 @@ where
 
         Table {
             schema,
-            primary,
-            auxiliary,
+            state: TableState { primary, auxiliary },
         }
     }
 
@@ -357,39 +351,28 @@ where
 
         Ok(Table {
             schema,
-            primary,
-            auxiliary,
+            state: TableState { primary, auxiliary },
         })
     }
 }
 
-/// A database table with support for multiple indices
-pub struct Table<S, IS, C, G> {
-    schema: Arc<TableSchema<S>>,
+struct TableState<IS, C, G> {
     primary: BTree<IS, C, G>,
     auxiliary: HashMap<String, BTree<IS, C, G>>,
 }
 
-impl<S, IS, C, G> Clone for Table<S, IS, C, G>
-where
-    C: Clone,
-    G: Clone,
-{
+impl<IS, C: Clone, G: Clone> Clone for TableState<IS, C, G> {
     fn clone(&self) -> Self {
         Self {
-            schema: self.schema.clone(),
             primary: self.primary.clone(),
             auxiliary: self.auxiliary.clone(),
         }
     }
 }
 
-impl<S, C, G> Table<S, S::Index, C, G>
-where
-    S: Schema,
-{
+impl<IS, C, G> TableState<IS, C, G> {
     #[inline]
-    fn get_index<'a, Id>(&'a self, index_id: Id) -> Option<&'a BTree<S::Index, C, G>>
+    fn get_index<'a, Id>(&'a self, index_id: Id) -> Option<&'a BTree<IS, C, G>>
     where
         IndexId<'a>: From<Id>,
     {
@@ -399,134 +382,87 @@ where
         }
     }
 }
-
-impl<S, C, FE, G> Table<S, S::Index, C, G>
+impl<IS, C, FE, G> TableState<IS, C, G>
 where
-    S: Schema,
-    C: Collate<Value = S::Value> + 'static,
-    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    IS: IndexSchema,
+    C: Collate<Value = IS::Value> + 'static,
+    FE: AsType<Node<IS::Value>> + Send + Sync + 'static,
     G: DirDeref<Entry = FE> + 'static,
-    Node<S::Value>: FileLoad,
-    Range<S::Id, S::Value>: fmt::Debug,
+    Node<IS::Value>: FileLoad,
+    Range<IS::Id, IS::Value>: fmt::Debug,
 {
-    /// Return `true` if the given `key` is present in this [`Table`].
-    pub async fn contains(&self, key: &[S::Value]) -> Result<bool, io::Error> {
-        let key_len = self.schema.key().len();
-
-        if key.len() == key_len {
-            self.primary.contains(key).await
-        } else {
-            Err(bad_key(key, key_len))
-        }
+    async fn contains(&self, prefix: &[IS::Value]) -> Result<bool, io::Error> {
+        self.primary.contains(prefix).await
     }
 
-    /// Return the first row in the given `range` using the given `order`.
-    pub async fn first<'a>(
+    async fn get_row(&self, key: Key<IS::Value>) -> Result<Option<Row<IS::Value>>, io::Error> {
+        self.primary.first(b_tree::Range::from_prefix(key)).await
+    }
+
+    async fn first<'a>(
         &'a self,
-        range: Range<S::Id, S::Value>,
-        order: &'a [S::Id],
-    ) -> Result<Option<Row<S::Value>>, io::Error> {
-        let range = range.into_inner();
-        let plan = self.schema.plan_query(&range, order)?;
-        self.first_inner(plan).await
-    }
-
-    /// Look up a row by its `key`.
-    pub async fn get_row<K: Into<Key<S::Value>>>(
-        &self,
-        key: K,
-    ) -> Result<Option<Row<S::Value>>, io::Error> {
-        let key = key.into();
-        let key_len = self.schema.key().len();
-
-        if key.len() == key_len {
-            self.primary.first(&b_tree::Range::from_prefix(key)).await
-        } else {
-            Err(bad_key(&key, key_len))
-        }
-    }
-
-    /// Look up a value by its `key`.
-    pub async fn get_value<K: Into<Key<S::Value>>>(
-        &self,
-        key: K,
-    ) -> Result<Option<Row<S::Value>>, io::Error> {
-        let key = key.into();
-        let key_len = self.schema.key().len();
-
-        if key.len() == key_len {
-            self.primary
-                .first(&b_tree::Range::from_prefix(key))
-                .map_ok(|maybe_row| maybe_row.map(|mut row| row.drain(key_len..).collect()))
-                .await
-        } else {
-            Err(bad_key(&key, key_len))
-        }
-    }
-
-    async fn first_inner<'a>(
-        &'a self,
-        plan: QueryPlan<'a, S::Id>,
-    ) -> Result<Option<Row<S::Value>>, io::Error> {
+        plan: QueryPlan<'a, IS::Id>,
+        range: HashMap<IS::Id, ColumnRange<IS::Value>>,
+    ) -> Result<Option<Row<IS::Value>>, io::Error> {
         todo!()
     }
 }
-
-impl<S, C, FE, G> Table<S, S::Index, C, G>
+impl<IS, C, FE, G> TableState<IS, C, G>
 where
-    S: Schema,
-    C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
-    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    IS: IndexSchema,
+    C: Collate<Value = IS::Value> + Clone + Send + Sync + 'static,
+    FE: AsType<Node<IS::Value>> + Send + Sync + 'static,
     G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
-    Node<S::Value>: FileLoad,
-    Range<S::Id, S::Value>: fmt::Debug,
+    Node<IS::Value>: FileLoad,
+    Range<IS::Id, IS::Value>: fmt::Debug,
 {
-    /// Count how many rows in this [`Table`] lie within the given `range`.
-    pub async fn count(&self, range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
-        if range.is_default() {
-            self.primary.count(&b_tree::Range::default()).await
-        } else {
-            // TODO: optimize
-            let mut rows = self.rows(range, &[], false, None).await?;
-
-            let mut count = 0;
-            while let Some(_row) = rows.try_next().await? {
-                count += 1;
-            }
-
-            Ok(count)
-        }
-    }
-
-    /// Return `true` if the given [`Range`] of this [`Table`] does not contain any rows.
-    pub async fn is_empty(&self, range: Range<S::Id, S::Value>) -> Result<bool, io::Error> {
-        if range.is_default() {
-            self.primary.is_empty(&b_tree::Range::default()).await
-        } else {
-            let mut rows = self.rows(range, &[], false, None).await?;
-
-            rows.try_next()
-                .map_ok(|maybe_row| maybe_row.is_none())
-                .await
-        }
-    }
-
-    /// Construct a [`Stream`] of the `select`ed columns of the [`Rows`] within the given `range`.
-    pub async fn rows<'a>(
+    async fn count<'a>(
         &'a self,
-        range: Range<S::Id, S::Value>,
-        order: &'a [S::Id],
+        plan: QueryPlan<'a, IS::Id>,
+        range: HashMap<IS::Id, ColumnRange<IS::Value>>,
+        key_columns: &'a [IS::Id],
+    ) -> Result<u64, io::Error> {
+        // TODO: optimize
+        let mut rows = self
+            .rows(plan, range, &[], false, key_columns, key_columns)
+            .await?;
+
+        let mut count = 0;
+        while let Some(_row) = rows.try_next().await? {
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
+    async fn is_empty<'a>(
+        &'a self,
+        plan: QueryPlan<'a, IS::Id>,
+        range: HashMap<IS::Id, ColumnRange<IS::Value>>,
+        key_columns: &'a [IS::Id],
+    ) -> Result<bool, io::Error> {
+        let mut rows = self
+            .rows(plan, range, &[], false, key_columns, key_columns)
+            .await?;
+
+        rows.try_next()
+            .map_ok(|maybe_row| maybe_row.is_none())
+            .await
+    }
+
+    async fn rows<'a>(
+        &'a self,
+        mut plan: QueryPlan<'a, IS::Id>,
+        mut range: HashMap<IS::Id, ColumnRange<IS::Value>>,
+        order: &'a [IS::Id],
         reverse: bool,
-        select: Option<&'a [S::Id]>,
-    ) -> Result<Rows<S::Value>, io::Error> {
+        select: &'a [IS::Id],
+        key_columns: &'a [IS::Id],
+    ) -> Result<Rows<IS::Value>, io::Error> {
         #[cfg(feature = "logging")]
         log::debug!("Table::rows with order {order:?}");
 
-        let mut range = range.into_inner();
-
-        let mut plan = self.schema.plan_query(&range, order)?;
-
-        let mut keys: Option<(b_tree::Keys<S::Value>, &'a [S::Id])> = None;
+        let mut keys: Option<(b_tree::Keys<IS::Value>, &'a [IS::Id])> = None;
 
         let last_query = plan.indices.pop();
 
@@ -639,8 +575,6 @@ where
             }
         }
 
-        let select = select.unwrap_or(self.schema.primary().columns());
-
         if let Some((keys, columns)) = keys {
             if select.iter().all(|c| columns.contains(c)) {
                 // if all columns to select are already present, return the stream
@@ -655,10 +589,8 @@ where
             } else {
                 // otherwise, construct a stream of rows by extracting & selecting each primary key
 
-                assert!(self.schema.key().iter().all(|c| columns.contains(c)));
-
                 let index = self.primary.clone();
-                let extract_prefix = prefix_extractor(columns, self.schema.key());
+                let extract_prefix = prefix_extractor(columns, key_columns);
 
                 let rows = keys
                     .map_ok(extract_prefix)
@@ -672,14 +604,14 @@ where
                 Ok(Box::pin(rows))
             }
         } else {
-            let columns = self.schema.primary().columns();
+            let columns = self.primary.schema().columns();
             let index_range = index_range_for(columns, &mut range);
 
             assert!(range.is_empty());
 
             let keys = self.primary.clone().keys(index_range, reverse).await?;
 
-            if select == self.schema.primary().columns() {
+            if select == columns {
                 Ok(keys)
             } else {
                 let extract_prefix = prefix_extractor(columns, select);
@@ -687,18 +619,6 @@ where
                 Ok(Box::pin(rows))
             }
         }
-    }
-
-    /// Consume this [`TableReadGuard`] to construct a [`Stream`] of all the rows in the [`Table`].
-    pub async fn into_rows(self) -> Result<Rows<S::Value>, io::Error> {
-        let rows = self.primary.keys(b_tree::Range::default(), false).await?;
-        Ok(Box::pin(rows))
-    }
-}
-
-impl<S: fmt::Debug, IS, C, G> fmt::Debug for Table<S, IS, C, G> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "table with schema {:?}", self.schema.inner())
     }
 }
 
@@ -793,32 +713,15 @@ where
     }
 }
 
-impl<S, IS, C, FE> Table<S, IS, C, DirWriteGuardOwned<FE>> {
-    /// Downgrade this write lock to a read lock.
-    pub fn downgrade(self) -> Table<S, IS, C, Arc<DirReadGuardOwned<FE>>> {
-        Table {
-            schema: self.schema,
-            primary: self.primary.downgrade(),
-            auxiliary: self
-                .auxiliary
-                .into_iter()
-                .map(|(name, index)| (name, index.downgrade()))
-                .collect(),
-        }
-    }
-}
-
-impl<S, C, FE> Table<S, S::Index, C, DirWriteGuardOwned<FE>>
+impl<IS, C, FE> TableState<IS, C, DirWriteGuardOwned<FE>>
 where
-    S: Schema + Send + Sync,
-    C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
-    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
-    <S as Schema>::Index: Send + Sync,
-    Node<S::Value>: FileLoad,
+    IS: IndexSchema + Send + Sync,
+    C: Collate<Value = IS::Value> + Clone + Send + Sync + 'static,
+    FE: AsType<Node<IS::Value>> + Send + Sync + 'static,
+    DirWriteGuardOwned<FE>: DirDeref<Entry = FE>,
+    Node<IS::Value>: FileLoad,
 {
-    /// Delete a row from this [`Table`] by its `key`.
-    /// Returns `true` if the given `key` was present.
-    pub async fn delete_row(&mut self, key: Key<S::Value>) -> Result<bool, S::Error> {
+    async fn delete_row(&mut self, key: Key<IS::Value>) -> Result<bool, io::Error> {
         let row = if let Some(row) = self.get_row(key).await? {
             row
         } else {
@@ -827,11 +730,26 @@ where
 
         let mut deletes = IndexStack::with_capacity(self.auxiliary.len() + 1);
 
-        for (name, index) in self.auxiliary.iter_mut() {
-            deletes.push(async {
-                let index_key = self.schema.extract_key(name.into(), &row);
-                index.delete(&index_key).await
-            })
+        for (_name, index) in self.auxiliary.iter_mut() {
+            let index_key = index
+                .schema()
+                .columns()
+                .iter()
+                .map(|col_name| {
+                    // TODO: dedupe & optimize this O(n) logic
+                    let i = self
+                        .primary
+                        .schema()
+                        .columns()
+                        .iter()
+                        .position(|c| c == col_name)
+                        .expect("column index");
+
+                    row[i].clone()
+                })
+                .collect::<Key<_>>();
+
+            deletes.push(async move { index.delete(&index_key).await })
         }
 
         self.primary.delete(&row).await?;
@@ -843,37 +761,18 @@ where
         Ok(true)
     }
 
-    /// Delete all rows in the given `range` from this [`Table`].
-    pub async fn delete_range(&mut self, range: Range<S::Id, S::Value>) -> Result<usize, S::Error> {
-        #[cfg(feature = "logging")]
-        log::debug!("Table::delete_range {range:?}");
-
-        let range = range.into_inner();
-        let plan = self.schema.plan_query(&range, &[])?;
-
+    async fn delete_range<'a>(
+        &'a mut self,
+        plan: QueryPlan<'a, IS::Id>,
+        range: HashMap<IS::Id, ColumnRange<IS::Value>>,
+    ) -> Result<usize, io::Error> {
         todo!()
     }
 
-    /// Delete all rows from the `other` table from this one.
-    /// The `other` table **must** have an identical schema and collation.
-    pub async fn delete_all(
-        &mut self,
-        mut other: TableReadGuard<S, S::Index, C, FE>,
-    ) -> Result<(), S::Error> {
-        // no need to check the collator for equality, that will be done in the index operations
-
-        // but do check that the indices to merge are the same
-        if self.schema != other.schema {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "cannot delete the contents of a table with schema {:?} from one with schema {:?}",
-                    other.schema.inner(), self.schema.inner()
-                ),
-            )
-            .into());
-        }
-
+    async fn delete_all<OG>(&mut self, mut other: TableState<IS, C, OG>) -> Result<(), io::Error>
+    where
+        OG: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
+    {
         let mut deletes = IndexStack::with_capacity(self.auxiliary.len() + 1);
 
         deletes.push(self.primary.delete_all(other.primary));
@@ -888,12 +787,294 @@ where
         Ok(())
     }
 
+    async fn merge<OG>(&mut self, mut other: TableState<IS, C, OG>) -> Result<(), io::Error>
+    where
+        OG: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
+    {
+        let mut merges = IndexStack::with_capacity(self.auxiliary.len() + 1);
+
+        merges.push(self.primary.merge(other.primary));
+
+        for (name, this) in self.auxiliary.iter_mut() {
+            let that = other.auxiliary.remove(name).expect("other index");
+            merges.push(this.merge(that));
+        }
+
+        try_join_all(merges).await?;
+
+        Ok(())
+    }
+
+    async fn upsert(&mut self, row: Vec<IS::Value>) -> Result<bool, io::Error> {
+        let mut inserts = IndexStack::with_capacity(self.auxiliary.len() + 1);
+
+        for (_name, index) in self.auxiliary.iter_mut() {
+            let index_key = index
+                .schema()
+                .columns()
+                .iter()
+                .map(|col_name| {
+                    // TODO: dedupe & optimize this O(n) logic
+                    let i = self
+                        .primary
+                        .schema()
+                        .columns()
+                        .iter()
+                        .position(|c| c == col_name)
+                        .expect("column index");
+
+                    row[i].clone()
+                })
+                .collect();
+
+            inserts.push(index.insert(index_key));
+        }
+
+        inserts.push(self.primary.insert(row));
+
+        let mut inserts = try_join_all(inserts).await?;
+        let new = inserts.pop().expect("insert");
+        while let Some(index_new) = inserts.pop() {
+            assert_eq!(new, index_new, "index out of sync");
+        }
+
+        Ok(new)
+    }
+
+    async fn truncate(&mut self) -> Result<(), io::Error> {
+        let mut truncates = IndexStack::with_capacity(self.auxiliary.len() + 1);
+        truncates.push(self.primary.truncate());
+
+        for index in self.auxiliary.values_mut() {
+            truncates.push(index.truncate());
+        }
+
+        try_join_all(truncates).await?;
+
+        Ok(())
+    }
+}
+
+impl<IS, C, FE> TableState<IS, C, DirWriteGuardOwned<FE>> {
+    fn downgrade(self) -> TableState<IS, C, Arc<DirReadGuardOwned<FE>>> {
+        TableState {
+            primary: self.primary.downgrade(),
+            auxiliary: self
+                .auxiliary
+                .into_iter()
+                .map(|(name, index)| (name, index.downgrade()))
+                .collect(),
+        }
+    }
+}
+
+/// A database table with support for multiple indices
+pub struct Table<S, IS, C, G> {
+    schema: Arc<TableSchema<S>>,
+    state: TableState<IS, C, G>,
+}
+
+impl<S, IS, C, G> Clone for Table<S, IS, C, G>
+where
+    C: Clone,
+    G: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            schema: self.schema.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl<S, C, FE, G> Table<S, S::Index, C, G>
+where
+    S: Schema,
+    C: Collate<Value = S::Value> + 'static,
+    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    G: DirDeref<Entry = FE> + 'static,
+    Node<S::Value>: FileLoad,
+    Range<S::Id, S::Value>: fmt::Debug,
+{
+    /// Return `true` if the given `key` is present in this [`Table`].
+    pub async fn contains(&self, key: &[S::Value]) -> Result<bool, io::Error> {
+        let key_len = self.schema.key().len();
+
+        if key.len() == key_len {
+            self.state.contains(key).await
+        } else {
+            Err(bad_key(key, key_len))
+        }
+    }
+
+    /// Return the first row in the given `range` using the given `order`.
+    pub async fn first<'a>(
+        &'a self,
+        range: Range<S::Id, S::Value>,
+        order: &'a [S::Id],
+    ) -> Result<Option<Row<S::Value>>, io::Error> {
+        let range = range.into_inner();
+        let plan = self.schema.plan_query(&range, order)?;
+        self.state.first(plan, range).await
+    }
+
+    /// Look up a row by its `key`.
+    pub async fn get_row<K: Into<Key<S::Value>>>(
+        &self,
+        key: K,
+    ) -> Result<Option<Row<S::Value>>, io::Error> {
+        let key = key.into();
+        let key_len = self.schema.key().len();
+
+        if key.len() == key_len {
+            self.state.get_row(key).await
+        } else {
+            Err(bad_key(&key, key_len))
+        }
+    }
+
+    /// Look up a value by its `key`.
+    pub async fn get_value<K: Into<Key<S::Value>>>(
+        &self,
+        key: K,
+    ) -> Result<Option<Row<S::Value>>, io::Error> {
+        let key_len = self.schema.key().len();
+
+        self.get_row(key)
+            .map_ok(move |maybe_row| maybe_row.map(move |mut row| row.drain(key_len..).collect()))
+            .await
+    }
+}
+
+impl<S, C, FE, G> Table<S, S::Index, C, G>
+where
+    S: Schema,
+    C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
+    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    G: DirDeref<Entry = FE> + Clone + Send + Sync + 'static,
+    Node<S::Value>: FileLoad,
+    Range<S::Id, S::Value>: fmt::Debug,
+{
+    /// Count how many rows in this [`Table`] lie within the given `range`.
+    pub async fn count(&self, range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
+        let range = range.into_inner();
+        let plan = self.schema.plan_query(&range, &[])?;
+        self.state.count(plan, range, self.schema.key()).await
+    }
+
+    /// Return `true` if the given [`Range`] of this [`Table`] does not contain any rows.
+    pub async fn is_empty(&self, range: Range<S::Id, S::Value>) -> Result<bool, io::Error> {
+        let range = range.into_inner();
+        let plan = self.schema.plan_query(&range, &[])?;
+        self.state.is_empty(plan, range, self.schema.key()).await
+    }
+
+    /// Construct a [`Stream`] of the `select`ed columns of the [`Rows`] within the given `range`.
+    pub async fn rows<'a>(
+        &'a self,
+        range: Range<S::Id, S::Value>,
+        order: &'a [S::Id],
+        reverse: bool,
+        select: Option<&'a [S::Id]>,
+    ) -> Result<Rows<S::Value>, io::Error> {
+        #[cfg(feature = "logging")]
+        log::debug!("Table::rows with order {order:?}");
+
+        let range = range.into_inner();
+        let plan = self.schema.plan_query(&range, order)?;
+        let select = select.unwrap_or(self.schema.primary().columns());
+
+        self.state
+            .rows(plan, range, order, reverse, select, self.schema.key())
+            .await
+    }
+
+    /// Consume this [`TableReadGuard`] to construct a [`Stream`] of all the rows in the [`Table`].
+    pub async fn into_rows(self) -> Result<Rows<S::Value>, io::Error> {
+        let rows = self.rows(Range::default(), &[], false, None).await?;
+        Ok(Box::pin(rows))
+    }
+}
+
+impl<S: fmt::Debug, IS, C, G> fmt::Debug for Table<S, IS, C, G> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "table with schema {:?}", self.schema.inner())
+    }
+}
+
+impl<S, IS, C, FE> Table<S, IS, C, DirWriteGuardOwned<FE>> {
+    /// Downgrade this write lock to a read lock.
+    pub fn downgrade(self) -> Table<S, IS, C, Arc<DirReadGuardOwned<FE>>> {
+        Table {
+            schema: self.schema,
+            state: self.state.downgrade(),
+        }
+    }
+}
+
+impl<S, C, FE> Table<S, S::Index, C, DirWriteGuardOwned<FE>>
+where
+    S: Schema + Send + Sync,
+    C: Collate<Value = S::Value> + Clone + Send + Sync + 'static,
+    FE: AsType<Node<S::Value>> + Send + Sync + 'static,
+    <S as Schema>::Index: Send + Sync,
+    Node<S::Value>: FileLoad,
+{
+    /// Delete a row from this [`Table`] by its `key`.
+    /// Returns `true` if the given `key` was present.
+    pub async fn delete_row(&mut self, key: Key<S::Value>) -> Result<bool, io::Error> {
+        let key_len = self.schema.key().len();
+
+        if key.len() == key_len {
+            self.state.delete_row(key).await
+        } else {
+            Err(bad_key(&key, key_len))
+        }
+    }
+
+    /// Delete all rows in the given `range` from this [`Table`].
+    pub async fn delete_range(
+        &mut self,
+        range: Range<S::Id, S::Value>,
+    ) -> Result<usize, io::Error> {
+        #[cfg(feature = "logging")]
+        log::debug!("Table::delete_range {range:?}");
+
+        let range = range.into_inner();
+        let plan = self.schema.plan_query(&range, &[])?;
+
+        self.state.delete_range(plan, range).await
+    }
+
+    /// Delete all rows from the `other` table from this one.
+    /// The `other` table **must** have an identical schema and collation.
+    pub async fn delete_all(
+        &mut self,
+        other: TableReadGuard<S, S::Index, C, FE>,
+    ) -> Result<(), io::Error> {
+        // no need to check the collator for equality, that will be done in the index operations
+
+        // but do check that the indices to merge are the same
+        if self.schema != other.schema {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot delete the contents of a table with schema {:?} from one with schema {:?}",
+                    other.schema.inner(), self.schema.inner()
+                ),
+            )
+            .into());
+        }
+
+        self.state.delete_all(other.state).await
+    }
+
     /// Insert all rows from the `other` table into this one.
     /// The `other` table **must** have an identical schema and collation.
     pub async fn merge(
         &mut self,
-        mut other: TableReadGuard<S, S::Index, C, FE>,
-    ) -> Result<(), S::Error> {
+        other: TableReadGuard<S, S::Index, C, FE>,
+    ) -> Result<(), io::Error> {
         // no need to check the collator for equality, that will be done in the merge operations
 
         // but do check that the indices to merge are the same
@@ -909,18 +1090,7 @@ where
             .into());
         }
 
-        let mut merges = IndexStack::with_capacity(self.auxiliary.len() + 1);
-
-        merges.push(self.primary.merge(other.primary));
-
-        for (name, this) in self.auxiliary.iter_mut() {
-            let that = other.auxiliary.remove(name).expect("other index");
-            merges.push(this.merge(that));
-        }
-
-        try_join_all(merges).await?;
-
-        Ok(())
+        self.state.merge(other.state).await
     }
 
     /// Insert or update a row in this [`Table`].
@@ -930,28 +1100,14 @@ where
         key: Vec<S::Value>,
         values: Vec<S::Value>,
     ) -> Result<bool, S::Error> {
-        let key = self.schema.inner().validate_key(key)?;
-        let values = self.schema.inner().validate_values(values)?;
+        let key = self.schema.validate_key(key)?;
+        let values = self.schema.validate_values(values)?;
 
-        let mut row = key;
+        let mut row = Vec::with_capacity(key.len() + values.len());
+        row.extend(key);
         row.extend(values);
 
-        let mut inserts = IndexStack::with_capacity(self.auxiliary.len() + 1);
-
-        for (name, index) in self.auxiliary.iter_mut() {
-            let index_key = self.schema.extract_key(name.into(), &row);
-            inserts.push(index.insert(index_key.into_vec()));
-        }
-
-        inserts.push(self.primary.insert(row));
-
-        let mut inserts = try_join_all(inserts).await?;
-        let new = inserts.pop().expect("insert");
-        while let Some(index_new) = inserts.pop() {
-            assert_eq!(new, index_new, "index out of sync");
-        }
-
-        Ok(new)
+        self.state.upsert(row).map_err(S::Error::from).await
     }
 
     /// Delete all rows from this [`Table`].
@@ -959,16 +1115,7 @@ where
         #[cfg(feature = "logging")]
         log::debug!("Table::truncate");
 
-        let mut truncates = IndexStack::with_capacity(self.auxiliary.len() + 1);
-        truncates.push(self.primary.truncate());
-
-        for index in self.auxiliary.values_mut() {
-            truncates.push(index.truncate());
-        }
-
-        try_join_all(truncates).await?;
-
-        Ok(())
+        self.state.truncate().await
     }
 }
 
@@ -978,23 +1125,4 @@ fn bad_key<V: fmt::Debug>(key: &[V], key_len: usize) -> io::Error {
         io::ErrorKind::InvalidInput,
         format!("invalid key: {key:?}, expected exactly {key_len} column(s)",),
     )
-}
-
-#[inline]
-fn try_join_all<'a, O, F>(
-    mut futures: IndexStack<F>,
-) -> Pin<Box<dyn Future<Output = Result<IndexStack<O>, io::Error>> + Send + 'a>>
-where
-    O: Send + 'a,
-    F: Future<Output = Result<O, io::Error>> + Send + 'a,
-{
-    Box::pin(async move {
-        if let Some(fut) = futures.pop() {
-            let (out, mut others) = try_join!(fut, try_join_all(futures))?;
-            others.push(out);
-            Ok(others)
-        } else {
-            Ok(IndexStack::new())
-        }
-    })
 }

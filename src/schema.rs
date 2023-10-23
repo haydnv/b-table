@@ -44,8 +44,8 @@ impl<'a> fmt::Debug for IndexId<'a> {
 }
 
 /// The schema of a table index
-pub trait IndexSchema: BTreeSchema + Clone {
-    type Id: Hash + Eq + Clone + fmt::Debug + fmt::Display;
+pub trait IndexSchema: BTreeSchema + Clone + Send + Sync + 'static {
+    type Id: Hash + Eq + Clone + fmt::Debug + fmt::Display + 'static;
 
     /// Borrow the list of columns specified by this schema.
     fn columns(&self) -> &[Self::Id];
@@ -315,18 +315,6 @@ impl<S> TableSchema<S> {
 }
 
 impl<S: Schema> TableSchema<S> {
-    #[inline]
-    pub fn extract_key(&self, index_id: IndexId, row: &[S::Value]) -> b_tree::Key<S::Value> {
-        let index = self.get_index(index_id).expect("index");
-
-        index
-            .columns()
-            .iter()
-            .filter_map(|col_name| self.primary().columns().iter().position(|c| c == col_name))
-            .map(|i| row[i].clone())
-            .collect()
-    }
-
     #[inline]
     pub fn get_index<'a>(&'a self, index_id: IndexId<'a>) -> Option<&'a S::Index> {
         match index_id {

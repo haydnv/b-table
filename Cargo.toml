@@ -14,7 +14,7 @@ categories = ["database", "database-implementations", "data-structures"]
 [features]
 all = ["logging", "stream"]
 logging = ["log", "b-tree/logging", "freqfs/logging"]
-stream = ["async-trait", "b-tree/stream", "destream"]
+stream = ["async-trait", "b-tree/stream", "destream/smallvec"]
 
 [[example]]
 name = "example"
@@ -23,7 +23,7 @@ required-features = ["stream"]
 [dependencies]
 async-trait = { version = "0.1", optional = true }
 b-tree = { path = "../b-tree" }
-destream = { version = "0.7", optional = true }
+destream = { version = "~0.7.1", optional = true }
 freqfs = "~0.8.2"
 futures = "0.3"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }

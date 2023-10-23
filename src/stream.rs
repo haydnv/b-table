@@ -2,6 +2,7 @@ use std::fmt;
 
 use async_trait::async_trait;
 use b_tree::collate::Collate;
+use b_tree::Key;
 use destream::de;
 use freqfs::{DirLock, FileLoad};
 use futures::TryFutureExt;
@@ -36,10 +37,11 @@ where
 
         let mut table = self.table.write().await;
 
-        while let Some(mut row) = seq.next_element::<Vec<S::Value>>(()).await? {
-            if row.len() >= key_len {
-                let values = row.drain(key_len..).collect();
-                let key = row;
+        while let Some(mut row) = seq.next_element::<Key<S::Value>>(()).await? {
+            if row.len() == self.table.schema().primary().len() {
+                let values = row.drain(key_len..).collect::<Vec<_>>();
+                let key = row.into_vec();
+
                 table.upsert(key, values).map_err(de::Error::custom).await?;
             } else {
                 return Err(de::Error::invalid_length(
