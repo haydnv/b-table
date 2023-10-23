@@ -6,6 +6,7 @@ use std::{fmt, io, iter};
 
 use b_tree::collate::*;
 
+use crate::plan::QueryPlan;
 pub use b_tree::Schema as BTreeSchema;
 
 /// An ID type used to look up a specific table index
@@ -342,6 +343,22 @@ impl<S: Schema> TableSchema<S> {
         let aux = self.inner.auxiliary().iter().map(|(name, _)| name.into());
 
         iter::once(IndexId::Primary).chain(aux)
+    }
+
+    pub fn plan_query<'a>(
+        &'a self,
+        range: &HashMap<S::Id, ColumnRange<S::Value>>,
+        order: &'a [S::Id],
+    ) -> Result<QueryPlan<'a, S::Id>, io::Error> {
+        QueryPlan::new(self, &range, order).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "{:?} has no index to support range {range:?} and order {order:?}",
+                    self.inner
+                ),
+            )
+        })
     }
 }
 

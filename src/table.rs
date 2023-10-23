@@ -420,12 +420,15 @@ where
         }
     }
 
-    /// Return the first row in the given `range`, if any.
-    pub async fn first(
-        &self,
+    /// Return the first row in the given `range` using the given `order`.
+    pub async fn first<'a>(
+        &'a self,
         range: Range<S::Id, S::Value>,
+        order: &'a [S::Id],
     ) -> Result<Option<Row<S::Value>>, io::Error> {
-        todo!()
+        let range = range.into_inner();
+        let plan = self.schema.plan_query(&range, order)?;
+        self.first_inner(plan).await
     }
 
     /// Look up a row by its `key`.
@@ -459,6 +462,13 @@ where
         } else {
             Err(bad_key(&key, key_len))
         }
+    }
+
+    async fn first_inner<'a>(
+        &'a self,
+        plan: QueryPlan<'a, S::Id>,
+    ) -> Result<Option<Row<S::Value>>, io::Error> {
+        todo!()
     }
 }
 
@@ -514,12 +524,7 @@ where
 
         let mut range = range.into_inner();
 
-        let mut plan = QueryPlan::new(&self.schema, &range, order).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{self:?} has no index to query {range:?} with order {order:?}"),
-            )
-        })?;
+        let mut plan = self.schema.plan_query(&range, order)?;
 
         let mut keys: Option<(b_tree::Keys<S::Value>, &'a [S::Id])> = None;
 
@@ -841,7 +846,10 @@ where
     /// Delete all rows in the given `range` from this [`Table`].
     pub async fn delete_range(&mut self, range: Range<S::Id, S::Value>) -> Result<usize, S::Error> {
         #[cfg(feature = "logging")]
-        log::debug!("Table::delete_range");
+        log::debug!("Table::delete_range {range:?}");
+
+        let range = range.into_inner();
+        let plan = self.schema.plan_query(&range, &[])?;
 
         todo!()
     }
