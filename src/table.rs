@@ -400,16 +400,16 @@ where
     }
 
     async fn first<'a>(
-        &'a self,
-        plan: QueryPlan<'a, IS::Id>,
+        &self,
+        plan: &QueryPlan<'a, IS::Id>,
         mut range: HashMap<IS::Id, ColumnRange<IS::Value>>,
         select: &[IS::Id],
-        key_columns: &'a [IS::Id],
+        key_columns: &[IS::Id],
     ) -> Result<Option<Row<IS::Value>>, io::Error> {
-        let mut plan = plan.indices.into_iter();
+        let mut plan = plan.indices.iter();
 
         let (mut first, mut columns) = if let Some((index_id, query)) = plan.next() {
-            let index = self.get_index(index_id).expect("index");
+            let index = self.get_index(*index_id).expect("index");
             let columns = &index.schema().columns()[..query.selected(0)];
             let index_range = index_range_for(columns, &mut range);
 
@@ -425,7 +425,7 @@ where
         };
 
         for (index_id, query) in plan {
-            let index = self.get_index(index_id).expect("index");
+            let index = self.get_index(*index_id).expect("index");
 
             columns = &index.schema().columns()[..query.selected(columns.len())];
 
@@ -487,7 +487,7 @@ where
         range: HashMap<IS::Id, ColumnRange<IS::Value>>,
         key_columns: &'a [IS::Id],
     ) -> Result<bool, io::Error> {
-        self.first(plan, range, key_columns, key_columns)
+        self.first(&plan, range, key_columns, key_columns)
             .map_ok(|maybe_row| maybe_row.is_none())
             .await
     }
@@ -788,11 +788,22 @@ where
     }
 
     async fn delete_range<'a>(
-        &'a mut self,
+        &mut self,
         plan: QueryPlan<'a, IS::Id>,
         range: HashMap<IS::Id, ColumnRange<IS::Value>>,
+        key_columns: &[IS::Id],
     ) -> Result<usize, io::Error> {
-        todo!()
+        let mut deleted = 0;
+
+        while let Some(pk) = self
+            .first(&plan, range.clone(), key_columns, key_columns)
+            .await?
+        {
+            self.delete_row(pk).await?;
+            deleted += 1;
+        }
+
+        Ok(deleted)
     }
 
     async fn delete_all<OG>(&mut self, mut other: TableState<IS, C, OG>) -> Result<(), io::Error>
@@ -933,7 +944,7 @@ where
         let select = select.unwrap_or(self.schema.key());
 
         self.state
-            .first(plan, range, select, self.schema.key())
+            .first(&plan, range, select, self.schema.key())
             .await
     }
 
@@ -1062,7 +1073,9 @@ where
         let range = range.into_inner();
         let plan = self.schema.plan_query(&range, &[])?;
 
-        self.state.delete_range(plan, range).await
+        self.state
+            .delete_range(plan, range, self.schema.key())
+            .await
     }
 
     /// Delete all rows from the `other` table from this one.
