@@ -188,7 +188,12 @@ impl<K, V> Default for Range<K, V> {
 }
 
 impl<K, V> Range<K, V> {
-    /// Destructure this [`Range`] into a [`HashMap`] of [`ColumnRanges`].
+    /// Borrow this [`Range`]'s underlying [`HashMap`] of [`ColumnRange`]s.
+    pub fn inner(&self) -> &HashMap<K, ColumnRange<V>> {
+        &self.columns
+    }
+
+    /// Destructure this [`Range`] into a [`HashMap`] of [`ColumnRange`]s.
     pub fn into_inner(self) -> HashMap<K, ColumnRange<V>> {
         self.columns
     }

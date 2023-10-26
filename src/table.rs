@@ -396,13 +396,13 @@ where
     }
 
     async fn get_row(&self, key: Key<IS::Value>) -> Result<Option<Row<IS::Value>>, io::Error> {
-        self.primary.first(b_tree::Range::from_prefix(key)).await
+        self.primary.first(&b_tree::Range::from_prefix(key)).await
     }
 
     async fn first<'a>(
         &self,
         plan: &QueryPlan<'a, IS::Id>,
-        mut range: HashMap<IS::Id, ColumnRange<IS::Value>>,
+        range: &HashMap<IS::Id, ColumnRange<IS::Value>>,
         select: &[IS::Id],
         key_columns: &[IS::Id],
     ) -> Result<Option<Row<IS::Value>>, io::Error> {
@@ -411,17 +411,16 @@ where
         let (mut first, mut columns) = if let Some((index_id, query)) = plan.next() {
             let index = self.get_index(*index_id).expect("index");
             let columns = &index.schema().columns()[..query.selected(0)];
-            let index_range = index_range_for(columns, &mut range);
+            let index_range = index_range_borrow(columns, range);
 
-            if let Some(first) = index.first(index_range).await? {
+            if let Some(first) = index.first(&index_range).await? {
                 (first, columns)
             } else {
                 return Ok(None);
             }
         } else {
-            let index_range = index_range_for(self.primary.schema().columns(), &mut range);
-            assert!(range.is_empty());
-            return self.primary.first(index_range).await;
+            let index_range = index_range_borrow(self.primary.schema().columns(), range);
+            return self.primary.first(&index_range).await;
         };
 
         for (index_id, query) in plan {
@@ -429,9 +428,9 @@ where
 
             columns = &index.schema().columns()[..query.selected(columns.len())];
 
-            let index_range = index_range_for(columns, &mut range);
+            let index_range = index_range_borrow(columns, range);
 
-            first = if let Some(key) = index.first(index_range).await? {
+            first = if let Some(key) = index.first(&index_range).await? {
                 key
             } else {
                 return Ok(None);
@@ -487,7 +486,7 @@ where
         range: HashMap<IS::Id, ColumnRange<IS::Value>>,
         key_columns: &'a [IS::Id],
     ) -> Result<bool, io::Error> {
-        self.first(&plan, range, key_columns, key_columns)
+        self.first(&plan, &range, key_columns, key_columns)
             .map_ok(|maybe_row| maybe_row.is_none())
             .await
     }
@@ -510,12 +509,9 @@ where
             keys = if plan.indices.len() == 1 {
                 // if this is the only index to query, construct a stream of all keys in range
                 let columns = index.schema().columns();
-
                 let index_range = index_range_for(columns, &mut range);
                 assert!(range.is_empty());
-
                 let index_keys = index.clone().keys(index_range, reverse).await?;
-
                 Some((index_keys, columns))
             } else {
                 // otherwise, construct a stream over the unique prefixes in the first index
@@ -552,7 +548,7 @@ where
 
             let extract_prefix = prefix_extractor(columns_in, &columns_out[..columns_in.len()]);
 
-            let inner_range = inner_range_for(&query, &range);
+            let inner_range = inner_range_for(&query, &mut range);
 
             let n = columns_out.len();
             let index = index.clone();
@@ -586,7 +582,7 @@ where
 
                 let extract_prefix = prefix_extractor(columns_in, &columns_out[..columns_in.len()]);
 
-                let inner_range = inner_range_for(&query, &range);
+                let inner_range = inner_range_for(&query, &mut range);
 
                 let index = index.clone();
 
@@ -634,7 +630,7 @@ where
                     .map_ok(extract_prefix)
                     .map_ok(move |primary_key| {
                         let index = index.clone();
-                        async move { index.first(b_tree::Range::from(primary_key)).await }
+                        async move { index.first(&b_tree::Range::from(primary_key)).await }
                     })
                     .try_buffered(num_cpus::get())
                     .map_ok(|maybe_row| maybe_row.expect("row"));
@@ -661,7 +657,32 @@ where
 }
 
 #[inline]
-fn index_range_for<K: Eq + Hash, V>(
+fn index_range_borrow<'a, K: Eq + Hash, V>(
+    columns: &[K],
+    range: &'a HashMap<K, ColumnRange<V>>,
+) -> b_tree::Range<&'a V> {
+    let mut prefix = Key::with_capacity(range.len());
+
+    for col_name in columns {
+        if let Some(col_range) = range.get(col_name) {
+            match col_range {
+                ColumnRange::Eq(value) => {
+                    prefix.push(value);
+                }
+                ColumnRange::In((start, end)) => {
+                    return b_tree::Range::with_bounds(prefix, (start.as_ref(), end.as_ref()));
+                }
+            }
+        } else {
+            break;
+        }
+    }
+
+    b_tree::Range::from_prefix(prefix)
+}
+
+#[inline]
+fn index_range_for<'a, K: Eq + Hash, V>(
     columns: &[K],
     range: &mut HashMap<K, ColumnRange<V>>,
 ) -> b_tree::Range<V> {
@@ -795,10 +816,7 @@ where
     ) -> Result<usize, io::Error> {
         let mut deleted = 0;
 
-        while let Some(pk) = self
-            .first(&plan, range.clone(), key_columns, key_columns)
-            .await?
-        {
+        while let Some(pk) = self.first(&plan, &range, key_columns, key_columns).await? {
             self.delete_row(pk).await?;
             deleted += 1;
         }
@@ -944,7 +962,7 @@ where
         let select = select.unwrap_or(self.schema.key());
 
         self.state
-            .first(&plan, range, select, self.schema.key())
+            .first(&plan, &range, select, self.schema.key())
             .await
     }
 
