@@ -402,11 +402,57 @@ where
     async fn first<'a>(
         &'a self,
         plan: QueryPlan<'a, IS::Id>,
-        range: HashMap<IS::Id, ColumnRange<IS::Value>>,
+        mut range: HashMap<IS::Id, ColumnRange<IS::Value>>,
+        select: &[IS::Id],
+        key_columns: &'a [IS::Id],
     ) -> Result<Option<Row<IS::Value>>, io::Error> {
-        todo!()
+        let mut plan = plan.indices.into_iter();
+
+        let (mut first, mut columns) = if let Some((index_id, query)) = plan.next() {
+            let index = self.get_index(index_id).expect("index");
+            let columns = &index.schema().columns()[..query.selected(0)];
+            let index_range = index_range_for(columns, &mut range);
+
+            if let Some(first) = index.first(index_range).await? {
+                (first, columns)
+            } else {
+                return Ok(None);
+            }
+        } else {
+            let index_range = index_range_for(self.primary.schema().columns(), &mut range);
+            assert!(range.is_empty());
+            return self.primary.first(index_range).await;
+        };
+
+        for (index_id, query) in plan {
+            let index = self.get_index(index_id).expect("index");
+
+            columns = &index.schema().columns()[..query.selected(columns.len())];
+
+            let index_range = index_range_for(columns, &mut range);
+
+            first = if let Some(key) = index.first(index_range).await? {
+                key
+            } else {
+                return Ok(None);
+            }
+        }
+
+        if !select.iter().all(|col_name| columns.contains(col_name)) {
+            let pk = extract_columns(first, columns, key_columns);
+
+            first = self
+                .get_row(pk)
+                .map_ok(|maybe_row| maybe_row.expect("row"))
+                .await?;
+
+            columns = self.primary.schema().columns();
+        }
+
+        Ok(Some(extract_columns(first, columns, select)))
     }
 }
+
 impl<IS, C, FE, G> TableState<IS, C, G>
 where
     IS: IndexSchema,
@@ -424,7 +470,7 @@ where
     ) -> Result<u64, io::Error> {
         // TODO: optimize
         let mut rows = self
-            .rows(plan, range, &[], false, key_columns, key_columns)
+            .rows(plan, range, false, key_columns, key_columns)
             .await?;
 
         let mut count = 0;
@@ -441,11 +487,7 @@ where
         range: HashMap<IS::Id, ColumnRange<IS::Value>>,
         key_columns: &'a [IS::Id],
     ) -> Result<bool, io::Error> {
-        let mut rows = self
-            .rows(plan, range, &[], false, key_columns, key_columns)
-            .await?;
-
-        rows.try_next()
+        self.first(plan, range, key_columns, key_columns)
             .map_ok(|maybe_row| maybe_row.is_none())
             .await
     }
@@ -454,14 +496,10 @@ where
         &'a self,
         mut plan: QueryPlan<'a, IS::Id>,
         mut range: HashMap<IS::Id, ColumnRange<IS::Value>>,
-        order: &'a [IS::Id],
         reverse: bool,
         select: &'a [IS::Id],
         key_columns: &'a [IS::Id],
     ) -> Result<Rows<IS::Value>, io::Error> {
-        #[cfg(feature = "logging")]
-        log::debug!("Table::rows with order {order:?}");
-
         let mut keys: Option<(b_tree::Keys<IS::Value>, &'a [IS::Id])> = None;
 
         let last_query = plan.indices.pop();
@@ -731,23 +769,11 @@ where
         let mut deletes = IndexStack::with_capacity(self.auxiliary.len() + 1);
 
         for (_name, index) in self.auxiliary.iter_mut() {
-            let index_key = index
-                .schema()
-                .columns()
-                .iter()
-                .map(|col_name| {
-                    // TODO: dedupe & optimize this O(n) logic
-                    let i = self
-                        .primary
-                        .schema()
-                        .columns()
-                        .iter()
-                        .position(|c| c == col_name)
-                        .expect("column index");
-
-                    row[i].clone()
-                })
-                .collect::<Key<_>>();
+            let index_key = borrow_columns(
+                &row,
+                self.primary.schema().columns(),
+                index.schema().columns(),
+            );
 
             deletes.push(async move { index.delete(&index_key).await })
         }
@@ -809,23 +835,11 @@ where
         let mut inserts = IndexStack::with_capacity(self.auxiliary.len() + 1);
 
         for (_name, index) in self.auxiliary.iter_mut() {
-            let index_key = index
-                .schema()
-                .columns()
-                .iter()
-                .map(|col_name| {
-                    // TODO: dedupe & optimize this O(n) logic
-                    let i = self
-                        .primary
-                        .schema()
-                        .columns()
-                        .iter()
-                        .position(|c| c == col_name)
-                        .expect("column index");
-
-                    row[i].clone()
-                })
-                .collect();
+            let index_key = clone_columns(
+                &row,
+                self.primary.schema().columns(),
+                index.schema().columns(),
+            );
 
             inserts.push(index.insert(index_key));
         }
@@ -908,14 +922,19 @@ where
     }
 
     /// Return the first row in the given `range` using the given `order`.
-    pub async fn first<'a>(
-        &'a self,
+    pub async fn first(
+        &self,
         range: Range<S::Id, S::Value>,
-        order: &'a [S::Id],
+        order: &[S::Id],
+        select: Option<&[S::Id]>,
     ) -> Result<Option<Row<S::Value>>, io::Error> {
         let range = range.into_inner();
         let plan = self.schema.plan_query(&range, order)?;
-        self.state.first(plan, range).await
+        let select = select.unwrap_or(self.schema.key());
+
+        self.state
+            .first(plan, range, select, self.schema.key())
+            .await
     }
 
     /// Look up a row by its `key`.
@@ -985,7 +1004,7 @@ where
         let select = select.unwrap_or(self.schema.primary().columns());
 
         self.state
-            .rows(plan, range, order, reverse, select, self.schema.key())
+            .rows(plan, range, reverse, select, self.schema.key())
             .await
     }
 
@@ -1117,6 +1136,73 @@ where
 
         self.state.truncate().await
     }
+}
+
+#[inline]
+fn borrow_columns<'a, K, V>(row: &'a [V], columns_in: &[K], columns_out: &[K]) -> Key<&'a V>
+where
+    K: Eq,
+{
+    assert_eq!(row.len(), columns_in.len());
+
+    debug_assert!(columns_out
+        .iter()
+        .all(|col_name| columns_in.contains(col_name)));
+
+    columns_out
+        .iter()
+        .filter_map(|col_name| columns_in.iter().position(|c| c == col_name))
+        .map(|i| &row[i])
+        .collect()
+}
+
+#[inline]
+fn clone_columns<K, V>(row: &[V], columns_in: &[K], columns_out: &[K]) -> Vec<V>
+where
+    K: Eq,
+    V: Clone,
+{
+    assert_eq!(row.len(), columns_in.len());
+
+    debug_assert!(columns_out
+        .iter()
+        .all(|col_name| columns_in.contains(col_name)));
+
+    columns_out
+        .iter()
+        .filter_map(|col_name| columns_in.iter().position(|c| c == col_name))
+        .map(|i| row[i].clone())
+        .collect()
+}
+
+#[inline]
+fn extract_columns<K, V>(mut row: Key<V>, columns_in: &[K], columns_out: &[K]) -> Key<V>
+where
+    K: Eq + fmt::Debug,
+{
+    assert_eq!(row.len(), columns_in.len());
+
+    debug_assert!(
+        columns_out
+            .iter()
+            .all(|col_name| columns_in.contains(col_name)),
+        "input columns {columns_in:?} are missing some output columns {columns_out:?}"
+    );
+
+    let mut indices = IndexStack::with_capacity(columns_out.len());
+
+    for col_name in columns_out {
+        let mut index = columns_in
+            .iter()
+            .position(|c| c == col_name)
+            .expect("column index");
+
+        index -= indices.iter().filter(|i| *i < &index).count();
+
+        indices.push(index);
+    }
+
+    indices.into_iter().map(|i| row.remove(i)).collect()
 }
 
 #[inline]
