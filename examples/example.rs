@@ -12,7 +12,6 @@ use futures::TryStreamExt;
 use number_general::NumberCollator;
 use rand::Rng;
 use safecast::as_type;
-use smallvec::smallvec;
 use tokio::fs;
 
 const BLOCK_SIZE: usize = 4_096;
@@ -349,7 +348,7 @@ async fn main() -> Result<(), io::Error> {
 
     // test deleting a row
     {
-        table.write().await.delete_row(smallvec![1.into()]).await?;
+        table.write().await.delete_row(&[1.into()]).await?;
 
         let guard = table.read().await;
         assert_eq!(guard.count(Default::default()).await?, 1);
@@ -361,7 +360,7 @@ async fn main() -> Result<(), io::Error> {
 
     // test deleting the last row
     {
-        table.write().await.delete_row(smallvec![2.into()]).await?;
+        table.write().await.delete_row(&[2.into()]).await?;
 
         let guard = table.read().await;
         assert_eq!(guard.count(Default::default()).await?, 0);

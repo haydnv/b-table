@@ -395,8 +395,8 @@ where
         self.primary.contains(prefix).await
     }
 
-    async fn get_row(&self, key: Key<IS::Value>) -> Result<Option<Row<IS::Value>>, io::Error> {
-        self.primary.first(&b_tree::Range::from_prefix(key)).await
+    async fn get_row(&self, key: &[IS::Value]) -> Result<Option<Row<IS::Value>>, io::Error> {
+        self.primary.first(b_tree::Range::from_prefix(key)).await
     }
 
     async fn first<'a>(
@@ -413,14 +413,14 @@ where
             let columns = &index.schema().columns()[..query.selected(0)];
             let index_range = index_range_borrow(columns, range);
 
-            if let Some(first) = index.first(&index_range).await? {
+            if let Some(first) = index.first(index_range).await? {
                 (first, columns)
             } else {
                 return Ok(None);
             }
         } else {
             let index_range = index_range_borrow(self.primary.schema().columns(), range);
-            return self.primary.first(&index_range).await;
+            return self.primary.first(index_range).await;
         };
 
         for (index_id, query) in plan {
@@ -430,7 +430,7 @@ where
 
             let index_range = index_range_borrow(columns, range);
 
-            first = if let Some(key) = index.first(&index_range).await? {
+            first = if let Some(key) = index.first(index_range).await? {
                 key
             } else {
                 return Ok(None);
@@ -441,7 +441,7 @@ where
             let pk = extract_columns(first, columns, key_columns);
 
             first = self
-                .get_row(pk)
+                .get_row(&pk)
                 .map_ok(|maybe_row| maybe_row.expect("row"))
                 .await?;
 
@@ -630,7 +630,7 @@ where
                     .map_ok(extract_prefix)
                     .map_ok(move |primary_key| {
                         let index = index.clone();
-                        async move { index.first(&b_tree::Range::from(primary_key)).await }
+                        async move { index.first(b_tree::Range::from(primary_key)).await }
                     })
                     .try_buffered(num_cpus::get())
                     .map_ok(|maybe_row| maybe_row.expect("row"));
@@ -780,7 +780,7 @@ where
     DirWriteGuardOwned<FE>: DirDeref<Entry = FE>,
     Node<IS::Value>: FileLoad,
 {
-    async fn delete_row(&mut self, key: Key<IS::Value>) -> Result<bool, io::Error> {
+    async fn delete_row(&mut self, key: &[IS::Value]) -> Result<bool, io::Error> {
         let row = if let Some(row) = self.get_row(key).await? {
             row
         } else {
@@ -817,7 +817,7 @@ where
         let mut deleted = 0;
 
         while let Some(pk) = self.first(&plan, &range, key_columns, key_columns).await? {
-            self.delete_row(pk).await?;
+            self.delete_row(&pk).await?;
             deleted += 1;
         }
 
@@ -967,25 +967,18 @@ where
     }
 
     /// Look up a row by its `key`.
-    pub async fn get_row<K: Into<Key<S::Value>>>(
-        &self,
-        key: K,
-    ) -> Result<Option<Row<S::Value>>, io::Error> {
-        let key = key.into();
+    pub async fn get_row(&self, key: &[S::Value]) -> Result<Option<Row<S::Value>>, io::Error> {
         let key_len = self.schema.key().len();
 
         if key.len() == key_len {
-            self.state.get_row(key).await
+            self.state.get_row(&key).await
         } else {
             Err(bad_key(&key, key_len))
         }
     }
 
     /// Look up a value by its `key`.
-    pub async fn get_value<K: Into<Key<S::Value>>>(
-        &self,
-        key: K,
-    ) -> Result<Option<Row<S::Value>>, io::Error> {
+    pub async fn get_value(&self, key: &[S::Value]) -> Result<Option<Row<S::Value>>, io::Error> {
         let key_len = self.schema.key().len();
 
         self.get_row(key)
@@ -1070,7 +1063,7 @@ where
 {
     /// Delete a row from this [`Table`] by its `key`.
     /// Returns `true` if the given `key` was present.
-    pub async fn delete_row(&mut self, key: Key<S::Value>) -> Result<bool, io::Error> {
+    pub async fn delete_row(&mut self, key: &[S::Value]) -> Result<bool, io::Error> {
         let key_len = self.schema.key().len();
 
         if key.len() == key_len {
