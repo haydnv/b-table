@@ -499,6 +499,9 @@ where
         select: &'a [IS::Id],
         key_columns: &'a [IS::Id],
     ) -> Result<Rows<IS::Value>, io::Error> {
+        #[cfg(feature = "logging")]
+        log::debug!("construct row stream with plan {plan:?}");
+
         let mut keys: Option<(b_tree::Keys<IS::Value>, &'a [IS::Id])> = None;
 
         let last_query = plan.indices.pop();
@@ -506,26 +509,16 @@ where
         if let Some((index_id, query)) = plan.indices.first() {
             let index = self.get_index(*index_id).expect("index");
 
-            keys = if plan.indices.len() == 1 {
-                // if this is the only index to query, construct a stream of all keys in range
-                let columns = index.schema().columns();
-                let index_range = index_range_for(columns, &mut range);
-                assert!(range.is_empty());
-                let index_keys = index.clone().keys(index_range, reverse).await?;
-                Some((index_keys, columns))
-            } else {
-                // otherwise, construct a stream over the unique prefixes in the first index
-                let columns = &index.schema().columns()[..query.selected(0)];
-                assert!(query.range().iter().zip(columns).all(|(r, c)| *r == c));
+            let columns = &index.schema().columns()[..query.selected(0)];
+            assert!(query.range().iter().zip(columns).all(|(r, c)| *r == c));
 
-                let index_range = index_range_for(&columns[..query.range().len()], &mut range);
-                let index_prefixes = index
-                    .clone()
-                    .groups(index_range, columns.len(), reverse)
-                    .await?;
+            let index_range = index_range_for(&columns[..query.range().len()], &mut range);
+            let index_prefixes = index
+                .clone()
+                .groups(index_range, columns.len(), reverse)
+                .await?;
 
-                Some((index_prefixes, columns))
-            }
+            keys = Some((index_prefixes, columns));
         }
 
         // for each index before the last
@@ -574,7 +567,11 @@ where
 
                 let columns_out = &index.schema().columns();
 
-                debug_assert!(columns_out.len() > columns_in.len());
+                debug_assert!(
+                    columns_out.len() > columns_in.len(),
+                    "cannot select {columns_out:?} with prefix {columns_in:?}"
+                );
+
                 debug_assert!(columns_out
                     .iter()
                     .take(columns_in.len())
