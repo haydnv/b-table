@@ -39,7 +39,7 @@ pub struct TableLock<S, IS, C, FE> {
     dir: DirLock<FE>,
     primary: BTreeLock<IS, C, FE>,
     // use a BTreeMap to make sure index locks are always acquired in-order
-    auxiliary: BTreeMap<String, BTreeLock<IS, C, FE>>,
+    auxiliary: BTreeMap<Arc<str>, BTreeLock<IS, C, FE>>,
 }
 
 impl<S, IS, C, FE> Clone for TableLock<S, IS, C, FE>
@@ -111,7 +111,7 @@ where
                 BTreeLock::create(schema.clone(), collator.clone(), dir)
             }?;
 
-            auxiliary.insert(name.clone(), index);
+            auxiliary.insert(name.clone().into(), index);
         }
 
         std::mem::drop(dir_contents);
@@ -151,7 +151,7 @@ where
                 BTreeLock::load(schema.clone(), collator.clone(), dir.clone())
             }?;
 
-            auxiliary.insert(name.clone(), index);
+            auxiliary.insert(name.clone().into(), index);
         }
 
         std::mem::drop(dir_contents);
@@ -195,7 +195,8 @@ where
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in &self.auxiliary {
-            let index = index.read().await;
+            // assume index locks are always acquired and dropped in-order
+            let index = index.try_read().expect("index read");
             auxiliary.insert(name.clone(), index);
 
             #[cfg(feature = "logging")]
@@ -204,7 +205,7 @@ where
 
         Table {
             schema,
-            state: TableState { primary, auxiliary },
+            state: TableState { auxiliary, primary },
         }
     }
 
@@ -224,7 +225,8 @@ where
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in self.auxiliary {
-            let index = index.into_read().await;
+            // assume index locks are always acquired and dropped in-order
+            let index = index.try_read().expect("index read");
 
             #[cfg(feature = "logging")]
             log::trace!("locked index {name} for reading");
@@ -234,7 +236,7 @@ where
 
         Table {
             schema,
-            state: TableState { primary, auxiliary },
+            state: TableState { auxiliary, primary },
         }
     }
 
@@ -263,7 +265,7 @@ where
 
         Ok(Table {
             schema,
-            state: TableState { primary, auxiliary },
+            state: TableState { auxiliary, primary },
         })
     }
 
@@ -283,7 +285,8 @@ where
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in self.auxiliary.iter() {
-            let index = index.write().await;
+            // assume index locks are always acquired & dropped in-order
+            let index = index.try_write().expect("index write");
             auxiliary.insert(name.clone(), index);
 
             #[cfg(feature = "logging")]
@@ -292,7 +295,7 @@ where
 
         Table {
             schema,
-            state: TableState { primary, auxiliary },
+            state: TableState { auxiliary, primary },
         }
     }
 
@@ -312,7 +315,8 @@ where
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in self.auxiliary.into_iter() {
-            let index = index.into_write().await;
+            // assume index locks are always acquired and dropped in-order
+            let index = index.try_write().expect("index write");
 
             #[cfg(feature = "logging")]
             log::trace!("locked index {name} for writing");
@@ -322,7 +326,7 @@ where
 
         Table {
             schema,
-            state: TableState { primary, auxiliary },
+            state: TableState { auxiliary, primary },
         }
     }
 
@@ -351,14 +355,15 @@ where
 
         Ok(Table {
             schema,
-            state: TableState { primary, auxiliary },
+            state: TableState { auxiliary, primary },
         })
     }
 }
 
 struct TableState<IS, C, G> {
+    // IMPORTANT! the auxiliary field must go before primary so that it will be dropped first
+    auxiliary: HashMap<Arc<str>, BTree<IS, C, G>>,
     primary: BTree<IS, C, G>,
-    auxiliary: HashMap<String, BTree<IS, C, G>>,
 }
 
 impl<IS, C: Clone, G: Clone> Clone for TableState<IS, C, G> {
