@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::{fmt, io};
+use std::{fmt, io, mem};
 
 use b_tree::collate::Collate;
 use b_tree::{BTree, BTreeLock, Key};
@@ -10,7 +10,7 @@ use freqfs::{DirDeref, DirLock, DirReadGuardOwned, DirWriteGuardOwned, FileLoad}
 use futures::future::{try_join_all, TryFutureExt};
 use futures::stream::{Stream, TryStreamExt};
 use safecast::AsType;
-use smallvec::SmallVec;
+use smallvec::{smallvec, SmallVec};
 
 use super::plan::{IndexQuery, QueryPlan};
 use super::schema::*;
@@ -734,6 +734,7 @@ where
 fn prefix_extractor<K, V>(columns_in: &[K], columns_out: &[K]) -> impl Fn(Key<V>) -> Key<V> + Send
 where
     K: PartialEq + fmt::Debug,
+    V: Default + Clone,
 {
     debug_assert!(columns_out.len() <= columns_in.len());
     debug_assert!(!columns_out.is_empty());
@@ -745,24 +746,21 @@ where
     #[cfg(feature = "logging")]
     log::trace!("extract columns {columns_out:?} from {columns_in:?}");
 
-    let mut indices = IndexStack::with_capacity(columns_out.len());
-
-    for name_out in columns_out {
-        let mut index = columns_in
-            .iter()
-            .position(|name_in| name_in == name_out)
-            .expect("index");
-
-        index -= indices.iter().copied().filter(|i| *i < index).count();
-
-        indices.push(index);
-    }
+    let indices = columns_out
+        .iter()
+        .map(|name_out| {
+            columns_in
+                .iter()
+                .position(|name_in| name_in == name_out)
+                .expect("column index")
+        })
+        .collect::<IndexStack<_>>();
 
     move |mut key| {
-        let mut prefix = Key::with_capacity(indices.len() + 1);
+        let mut prefix = smallvec![V::default(); indices.len()];
 
-        for i in indices.iter().copied() {
-            prefix.push(key.remove(i));
+        for (i_to, i_from) in indices.iter().copied().enumerate() {
+            mem::swap(&mut key[i_from], &mut prefix[i_to]);
         }
 
         prefix
@@ -1200,6 +1198,7 @@ where
 fn extract_columns<K, V>(mut row: Key<V>, columns_in: &[K], columns_out: &[K]) -> Key<V>
 where
     K: Eq + fmt::Debug,
+    V: Default + Clone,
 {
     assert_eq!(row.len(), columns_in.len());
 
@@ -1210,20 +1209,18 @@ where
         "input columns {columns_in:?} are missing some output columns {columns_out:?}"
     );
 
-    let mut indices = IndexStack::with_capacity(columns_out.len());
+    let mut selection = smallvec![V::default(); columns_out.len()];
 
-    for col_name in columns_out {
-        let mut index = columns_in
+    for (i_to, name_out) in columns_out.iter().enumerate() {
+        let i_from = columns_in
             .iter()
-            .position(|c| c == col_name)
+            .position(|name_in| name_in == name_out)
             .expect("column index");
 
-        index -= indices.iter().filter(|i| *i < &index).count();
-
-        indices.push(index);
+        mem::swap(&mut row[i_from], &mut selection[i_to]);
     }
 
-    indices.into_iter().map(|i| row.remove(i)).collect()
+    selection
 }
 
 #[inline]
