@@ -195,8 +195,7 @@ where
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in &self.auxiliary {
-            // assume index locks are always acquired and dropped in-order
-            let index = index.try_read().expect("index read");
+            let index = index.read().await;
             auxiliary.insert(name.clone(), index);
 
             #[cfg(feature = "logging")]
@@ -225,8 +224,7 @@ where
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in self.auxiliary {
-            // assume index locks are always acquired and dropped in-order
-            let index = index.try_read().expect("index read");
+            let index = index.into_read().await;
 
             #[cfg(feature = "logging")]
             log::trace!("locked index {name} for reading");
@@ -285,8 +283,7 @@ where
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in self.auxiliary.iter() {
-            // assume index locks are always acquired & dropped in-order
-            let index = index.try_write().expect("index write");
+            let index = index.write().await;
             auxiliary.insert(name.clone(), index);
 
             #[cfg(feature = "logging")]
@@ -315,8 +312,7 @@ where
         // then lock each index in-order
         let mut auxiliary = HashMap::with_capacity(self.auxiliary.len());
         for (name, index) in self.auxiliary.into_iter() {
-            // assume index locks are always acquired and dropped in-order
-            let index = index.try_write().expect("index write");
+            let index = index.into_write().await;
 
             #[cfg(feature = "logging")]
             log::trace!("locked index {name} for writing");
