@@ -1,6 +1,6 @@
 [package]
 name = "b-table"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["code@tinychain.net"]
 edition = "2021"
 description = "A persistent database table based on b-tree"
@@ -14,7 +14,7 @@ categories = ["database", "database-implementations", "data-structures"]
 [features]
 all = ["logging", "stream"]
 logging = ["log", "b-tree/logging", "freqfs/logging"]
-stream = ["async-trait", "b-tree/stream", "destream"]
+stream = ["async-trait", "b-tree/stream", "destream/smallvec"]
 
 [[example]]
 name = "example"
@@ -22,18 +22,19 @@ required-features = ["stream"]
 
 [dependencies]
 async-trait = { version = "0.1", optional = true }
-b-tree = "~0.2.1"
-destream = { version = "0.7", optional = true }
-freqfs = "~0.8.2"
+b-tree = "0.3"
+destream = { version = "~0.7.1", optional = true }
+freqfs = "0.9"
 futures = "0.3"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }
-num_cpus = "1.15"
+num_cpus = "1.16"
 pin-project = "1.1"
 safecast = "0.2"
+smallvec = "1.11"
 
 [dev-dependencies]
 destream = "0.7"
-destream_json = { version = "0.11", features = ["value"] }
-number-general = "0.10"
+destream_json = { version = "0.12", features = ["value"] }
+number-general = "0.11"
 rand = "0.8"
-tokio = { version = "1.32", features = ["macros"] }
+tokio = { version = "1.33", features = ["macros"] }

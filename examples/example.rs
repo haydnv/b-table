@@ -4,7 +4,7 @@ use std::ops::Bound;
 use std::path::PathBuf;
 
 use b_table::collate::{self, Collate};
-use b_table::{BTreeSchema, IndexSchema as IndexSchemaInstance, Key, Node, Range, TableLock};
+use b_table::{BTreeSchema, IndexSchema as IndexSchemaInstance, Node, Range, TableLock};
 use destream::en;
 use destream_json::Value;
 use freqfs::Cache;
@@ -86,7 +86,7 @@ impl BTreeSchema for IndexSchema {
         8
     }
 
-    fn validate(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error> {
+    fn validate_key(&self, key: Vec<Self::Value>) -> Result<Vec<Self::Value>, Self::Error> {
         if key.len() == self.len() {
             Ok(key)
         } else {
@@ -103,24 +103,6 @@ impl IndexSchemaInstance for IndexSchema {
 
     fn columns(&self) -> &[Self::Id] {
         &self.columns
-    }
-
-    fn extract_key(&self, key: &[Self::Value], other: &Self) -> Key<Self::Value> {
-        assert_eq!(key.len(), self.len());
-
-        let mut other_key = Vec::with_capacity(other.len());
-        for i in 0..other.len() {
-            let column = &other.columns[i];
-            for j in 0..self.len() {
-                if column == &self.columns[j] {
-                    other_key.push(key[j].clone());
-                }
-            }
-        }
-
-        debug_assert_eq!(other_key.len(), other.len());
-
-        other_key
     }
 }
 
@@ -240,6 +222,7 @@ async fn main() -> Result<(), io::Error> {
     // create the table
     let table = TableLock::create(schema, Collator::new(), dir)?;
 
+    // test reading from an empty table
     {
         let guard = table.read().await;
         let range = Range::default();
@@ -254,6 +237,7 @@ async fn main() -> Result<(), io::Error> {
     }
 
     {
+        // test inserting a row
         {
             let mut guard = table.write().await;
 
@@ -264,6 +248,7 @@ async fn main() -> Result<(), io::Error> {
             assert!(!guard.upsert(key, values).await?);
         }
 
+        // test reading a row
         {
             let guard = table.read().await;
             assert_eq!(guard.count(Default::default()).await?, 1);
@@ -289,12 +274,14 @@ async fn main() -> Result<(), io::Error> {
         let key = row2[..1].to_vec();
         let values = row2[1..].to_vec();
 
+        // test inserting a second row
         {
             let mut guard = table.write().await;
             assert!(guard.upsert(key.clone(), values.clone()).await?);
             assert!(!guard.upsert(key, values).await?);
         }
 
+        // test reading a range
         {
             let guard = table.read().await;
 
@@ -324,27 +311,44 @@ async fn main() -> Result<(), io::Error> {
         }
     }
 
+    // test reading a stream of all rows
     {
         let guard = table.read().await;
-        let mut stream = guard.rows(Range::default(), &[], false, None)?;
+        let mut stream = guard.rows(Range::default(), &[], false, None).await?;
 
-        assert_eq!(stream.try_next().await?, Some(row1.clone()));
-        assert_eq!(stream.try_next().await?, Some(row2.clone()));
+        assert_eq!(
+            stream.try_next().await?,
+            Some(row1.iter().cloned().collect())
+        );
+        assert_eq!(
+            stream.try_next().await?,
+            Some(row2.iter().cloned().collect())
+        );
         assert_eq!(stream.try_next().await?, None);
 
         let range = Range::from_iter([(
-            "down".to_string().into(),
+            "down".to_string(),
             (Bound::Unbounded, Bound::Excluded(10.into())),
         )]);
 
-        let mut stream = guard.rows(range, &[], true, None)?;
-        assert_eq!(stream.try_next().await?, Some(row1.clone()));
-        assert_eq!(stream.try_next().await?, Some(row2.clone()));
+        let mut stream = guard.rows(range, &[], true, None).await?;
+
+        assert_eq!(
+            stream.try_next().await?,
+            Some(row1.iter().cloned().collect())
+        );
+
+        assert_eq!(
+            stream.try_next().await?,
+            Some(row2.iter().cloned().collect())
+        );
+
         assert_eq!(stream.try_next().await?, None);
     }
 
+    // test deleting a row
     {
-        table.write().await.delete_row(vec![1.into()]).await?;
+        table.write().await.delete_row(&[1.into()]).await?;
 
         let guard = table.read().await;
         assert_eq!(guard.count(Default::default()).await?, 1);
@@ -354,8 +358,9 @@ async fn main() -> Result<(), io::Error> {
         assert!(guard.is_empty(range).await?);
     }
 
+    // test deleting the last row
     {
-        table.write().await.delete_row(vec![2.into()]).await?;
+        table.write().await.delete_row(&[2.into()]).await?;
 
         let guard = table.read().await;
         assert_eq!(guard.count(Default::default()).await?, 0);
@@ -366,5 +371,6 @@ async fn main() -> Result<(), io::Error> {
         assert!(guard.is_empty(range).await?);
     }
 
+    // clean up
     fs::remove_dir_all(path).await
 }
