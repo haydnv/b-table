@@ -22,9 +22,9 @@ required-features = ["stream"]
 
 [dependencies]
 async-trait = { version = "0.1", optional = true }
-b-tree = { path = "../b-tree" }
+b-tree = "0.3"
 destream = { version = "~0.7.1", optional = true }
-freqfs = { path = "../freqfs" }
+freqfs = "0.9"
 futures = "0.3"
 log = { version = "0.4", features = ["release_max_level_info"], optional = true }
 num_cpus = "1.16"
@@ -34,7 +34,7 @@ smallvec = "1.11"
 
 [dev-dependencies]
 destream = "0.7"
-destream_json = { path = "../destream_json", features = ["value"] }
-number-general = { path = "../number-general" }
+destream_json = { version = "0.12", features = ["value"] }
+number-general = "0.11"
 rand = "0.8"
 tokio = { version = "1.33", features = ["macros"] }
