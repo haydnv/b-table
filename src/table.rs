@@ -77,25 +77,7 @@ where
 {
     /// Create a new [`Table`]
     pub fn create(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
-        for (index_name, index) in schema.auxiliary() {
-            for col_name in index.columns() {
-                if !schema.primary().columns().contains(col_name) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("index {index_name} refers to unknown column {col_name}"),
-                    ));
-                }
-            }
-
-            for col_name in schema.key() {
-                if !index.columns().contains(col_name) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("index {index_name} is missing primary key column {col_name}"),
-                    ));
-                }
-            }
-        }
+        valid_schema(&schema)?;
 
         let mut dir_contents = dir.try_write()?;
 
@@ -126,16 +108,7 @@ where
 
     /// Load an existing [`Table`] with the given `schema` from the given `dir`
     pub fn load(schema: S, collator: C, dir: DirLock<FE>) -> Result<Self, io::Error> {
-        for (name, index) in schema.auxiliary() {
-            for col_name in schema.key() {
-                if !index.columns().contains(col_name) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("index {} is missing primary key column {}", name, col_name),
-                    ));
-                }
-            }
-        }
+        valid_schema(&schema)?;
 
         let mut dir_contents = dir.try_write()?;
 
@@ -409,9 +382,9 @@ where
     ) -> Result<Option<Row<IS::Value>>, io::Error> {
         let mut plan = plan.indices.iter();
 
-        let (mut first, mut columns) = if let Some((index_id, query)) = plan.next() {
+        let (mut first, mut columns) = if let Some((index_id, _query)) = plan.next() {
             let index = self.get_index(*index_id).expect("index");
-            let columns = &index.schema().columns()[..query.selected(0)];
+            let columns = index.schema().columns();
             let index_range = index_range_borrow(columns, range);
 
             if let Some(first) = index.first(index_range).await? {
@@ -421,15 +394,24 @@ where
             }
         } else {
             let index_range = index_range_borrow(self.primary.schema().columns(), range);
-            return self.primary.first(index_range).await;
+
+            return self
+                .primary
+                .first(index_range)
+                .map_ok(|first| {
+                    first.map(|first| {
+                        extract_columns(first, self.primary.schema().columns(), select)
+                    })
+                })
+                .await;
         };
 
-        for (index_id, query) in plan {
+        for (index_id, _query) in plan {
             let index = self.get_index(*index_id).expect("index");
 
-            columns = &index.schema().columns()[..query.selected(columns.len())];
+            columns = index.schema().columns();
 
-            let index_range = index_range_borrow(columns, range);
+            let index_range = index_range_borrow(&columns, range);
 
             first = if let Some(key) = index.first(index_range).await? {
                 key
@@ -710,7 +692,7 @@ fn inner_range_for<'a, K, V>(
     range: &HashMap<K, ColumnRange<V>>,
 ) -> b_tree::Range<V>
 where
-    K: Eq + Hash,
+    K: Eq + Hash + fmt::Debug,
     V: Clone,
 {
     let mut inner_range = Key::with_capacity(query.range().len());
@@ -954,8 +936,8 @@ where
         select: Option<&[S::Id]>,
     ) -> Result<Option<Row<S::Value>>, io::Error> {
         let range = range.into_inner();
-        let plan = self.schema.plan_query(&range, order)?;
         let select = select.unwrap_or(self.schema.key());
+        let plan = self.schema.plan_query(&range, order, self.schema.key())?;
 
         self.state
             .first(&plan, &range, select, self.schema.key())
@@ -995,14 +977,14 @@ where
     /// Count how many rows in this [`Table`] lie within the given `range`.
     pub async fn count(&self, range: Range<S::Id, S::Value>) -> Result<u64, io::Error> {
         let range = range.into_inner();
-        let plan = self.schema.plan_query(&range, &[])?;
+        let plan = self.schema.plan_query(&range, &[], self.schema.key())?;
         self.state.count(plan, range, self.schema.key()).await
     }
 
     /// Return `true` if the given [`Range`] of this [`Table`] does not contain any rows.
     pub async fn is_empty(&self, range: Range<S::Id, S::Value>) -> Result<bool, io::Error> {
         let range = range.into_inner();
-        let plan = self.schema.plan_query(&range, &[])?;
+        let plan = self.schema.plan_query(&range, &[], Default::default())?;
         self.state.is_empty(plan, range, self.schema.key()).await
     }
 
@@ -1018,8 +1000,8 @@ where
         log::debug!("Table::rows with order {order:?}");
 
         let range = range.into_inner();
-        let plan = self.schema.plan_query(&range, order)?;
         let select = select.unwrap_or(self.schema.primary().columns());
+        let plan = self.schema.plan_query(&range, order, self.schema.key())?;
 
         self.state
             .rows(plan, range, reverse, select, self.schema.key())
@@ -1078,7 +1060,7 @@ where
         log::debug!("Table::delete_range {range:?}");
 
         let range = range.into_inner();
-        let plan = self.schema.plan_query(&range, &[])?;
+        let plan = self.schema.plan_query(&range, &[], self.schema.key())?;
 
         self.state
             .delete_range(plan, range, self.schema.key())
@@ -1199,9 +1181,13 @@ where
 fn extract_columns<K, V>(mut row: Key<V>, columns_in: &[K], columns_out: &[K]) -> Key<V>
 where
     K: Eq + fmt::Debug,
-    V: Default + Clone,
+    V: Default + Clone + fmt::Debug,
 {
-    assert_eq!(row.len(), columns_in.len());
+    assert_eq!(
+        row.len(),
+        columns_in.len(),
+        "row {row:?} does not match column schema {columns_in:?}"
+    );
 
     debug_assert!(
         columns_out
@@ -1230,4 +1216,27 @@ fn bad_key<V: fmt::Debug>(key: &[V], key_len: usize) -> io::Error {
         io::ErrorKind::InvalidInput,
         format!("invalid key: {key:?}, expected exactly {key_len} column(s)",),
     )
+}
+
+#[inline]
+fn valid_schema<S: Schema>(schema: &S) -> Result<(), io::Error> {
+    for (index_name, index) in schema.auxiliary() {
+        if index.columns().is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("index {index_name} is empty"),
+            ));
+        }
+
+        for col_name in index.columns() {
+            if !schema.primary().columns().contains(col_name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("index {index_name} refers to unknown column {col_name}"),
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }

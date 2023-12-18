@@ -18,10 +18,14 @@ pub(crate) struct IndexQuery<'a, K> {
     order: usize,
 }
 
-impl<'a, K: Eq> IndexQuery<'a, K> {
+impl<'a, K: Eq + fmt::Debug> IndexQuery<'a, K> {
     #[inline]
     pub fn new(columns: &'a [K], range: Columns<'a, K>, order: usize) -> Self {
-        debug_assert!(order <= columns.len());
+        debug_assert!(
+            order <= columns.len(),
+            "cannot order by the first {order} columns of {columns:?}"
+        );
+
         debug_assert!(range.iter().all(|c| columns.contains(c)));
 
         Self {
@@ -56,10 +60,8 @@ impl<'a, K: fmt::Debug> fmt::Debug for IndexQuery<'a, K> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "query {:?} column(s) to order by the first {} with a range over {:?}",
-            self.columns.len(),
-            self.order,
-            self.range
+            "query {:?} to order by the first {} with a range over {:?}",
+            self.columns, self.order, self.range
         )
     }
 }
@@ -79,7 +81,7 @@ impl<'a, K> Default for QueryPlan<'a, K> {
 
 impl<'a, K: Eq> Ord for QueryPlan<'a, K> {
     fn cmp(&self, other: &Self) -> Ordering {
-        // inverse order based on number of indices to query
+        // inverse order based on number of indices to query (since BinaryHeap is a max-heap)
         other.indices.len().cmp(&self.indices.len())
     }
 }
@@ -95,6 +97,7 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
         schema: &'a TableSchema<S>,
         range: &HashMap<K, ColumnRange<S::Value>>,
         order: &'a [K],
+        columns: &'a [K],
     ) -> Option<Self>
     where
         S: Schema<Id = K>,
@@ -112,7 +115,6 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
         let mut unvisited = VecDeque::with_capacity(candidates.capacity());
         unvisited.push_back(candidate);
 
-        // first, create a list of all candidates which cover the requested order (if any)
         while let Some(candidate) = unvisited.pop_front() {
             let supported_order = candidate.supported_order(order);
             let supported_range = candidate.supported_range();
@@ -129,6 +131,7 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
                     supported_order,
                     range,
                     order,
+                    columns,
                 );
 
                 unvisited.extend(candidates);
@@ -138,7 +141,7 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
 
             if supported_order == order
                 && supported_range.len() == range.len()
-                && schema.key().iter().all(|c| candidate.selects(c))
+                && columns.iter().all(|c| candidate.selects(c))
             {
                 candidates.push(candidate);
             }
@@ -162,6 +165,7 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
         supported_order: &'a [K],
         range: &HashMap<K, ColumnRange<S::Value>>,
         order: &'a [K],
+        columns: &'a [K],
     ) -> IndexStack<Self>
     where
         S: Schema<Id = K>,
@@ -170,8 +174,6 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
         debug_assert_eq!(supported_order, self.supported_order(order));
 
         let index = schema.get_index(index_id).expect("index");
-
-        debug_assert!(schema.key().iter().all(|c| index.columns().contains(c)));
 
         let present = selected
             .iter()
@@ -183,15 +185,18 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
         let mut unvisited = IndexStack::with_capacity(Ord::min(INDEX_STACK_SIZE, index.len() + 2));
 
         if selected.is_empty() {
-            // pass
+            // if no columns are selected yet, continue
         } else if present == 0 {
+            // if none of the selected columns are present in this index, it's not needed
             return unvisited;
         } else if index.columns()[present..].iter().any(|c| self.selects(c)) {
+            // if using this index would duplicate a selected column, don't use it (at least not in this order)
             return unvisited;
         } else if index.columns()[..present]
             .iter()
             .any(|c| !selected.contains(c))
         {
+            // if this index starts with a column that's not already selected, it can't be used
             return unvisited;
         }
 
@@ -231,7 +236,14 @@ impl<'a, K: Clone + Eq + Hash + fmt::Debug> QueryPlan<'a, K> {
                 .copied()
                 .collect::<Columns<_>>();
 
-            if covered_order > 0 || !covered_range.is_empty() {
+            // at this point there's no risk of duplicating a selected column (a check has already been passed)
+            let covered_columns = index_order
+                .last()
+                .map(|c| columns.contains(c))
+                .unwrap_or(false);
+
+            // if this index covers any of the uncovered order, or range, or needed columns, it's a candidate
+            if covered_order > 0 || !covered_range.is_empty() || covered_columns {
                 let query = IndexQuery::new(index_order, covered_range, covered_order);
                 unvisited.push(self.clone_and_push(index_id, query));
             }
@@ -441,20 +453,20 @@ mod test {
         let expected = QueryPlan::default();
 
         let range = HashMap::default();
-        let actual = QueryPlan::new(&schema, &range, &[]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &[], schema.key()).expect("plan");
         assert_eq!(expected, actual);
 
         let mut range = HashMap::new();
         range.insert("0", 0.into());
 
-        let actual = QueryPlan::new(&schema, &range, &[]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &[], schema.key()).expect("plan");
         assert_eq!(expected, actual);
 
         let mut range = HashMap::new();
         range.insert("0", 1.into());
         range.insert("1", (1..2).into());
 
-        let actual = QueryPlan::new(&schema, &range, &[]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &[], schema.key()).expect("plan");
         assert_eq!(expected, actual);
     }
 
@@ -486,7 +498,7 @@ mod test {
             ],
         };
 
-        let actual = QueryPlan::new(&schema, &range, &[]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &[], schema.key()).expect("plan");
         assert_eq!(expected, actual);
 
         let expected = QueryPlan {
@@ -502,7 +514,7 @@ mod test {
             ],
         };
 
-        let actual = QueryPlan::new(&schema, &range, &["0"]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &["0"], schema.key()).expect("plan");
         assert_eq!(expected, actual);
 
         let expected = QueryPlan {
@@ -518,7 +530,7 @@ mod test {
             ],
         };
 
-        let actual = QueryPlan::new(&schema, &range, &["0", "1"]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &["0", "1"], schema.key()).expect("plan");
         assert_eq!(expected, actual);
 
         let expected = QueryPlan {
@@ -534,7 +546,7 @@ mod test {
             ],
         };
 
-        let actual = QueryPlan::new(&schema, &range, &["0", "1", "2"]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &["0", "1", "2"], schema.key()).expect("plan");
         assert_eq!(expected, actual);
 
         let expected = QueryPlan {
@@ -550,7 +562,8 @@ mod test {
             ],
         };
 
-        let actual = QueryPlan::new(&schema, &range, &["0", "1", "2", "3"]).expect("plan");
+        let actual =
+            QueryPlan::new(&schema, &range, &["0", "1", "2", "3"], schema.key()).expect("plan");
         assert_eq!(expected, actual);
     }
 
@@ -580,7 +593,7 @@ mod test {
             )],
         };
 
-        let actual = QueryPlan::new(&schema, &range, &[]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &[], schema.key()).expect("plan");
         assert_eq!(expected, actual);
 
         let expected = QueryPlan {
@@ -590,7 +603,7 @@ mod test {
             )],
         };
 
-        let actual = QueryPlan::new(&schema, &range, &["1"]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &["1"], schema.key()).expect("plan");
         assert_eq!(expected, actual);
 
         let expected = QueryPlan {
@@ -600,7 +613,7 @@ mod test {
             )],
         };
 
-        let actual = QueryPlan::new(&schema, &range, &["1", "0"]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &["1", "0"], schema.key()).expect("plan");
         assert_eq!(expected, actual);
 
         let expected = QueryPlan {
@@ -613,10 +626,10 @@ mod test {
             ],
         };
 
-        let actual = QueryPlan::new(&schema, &range, &["0", "1"]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &["0", "1"], schema.key()).expect("plan");
         assert_eq!(expected, actual);
 
-        let actual = QueryPlan::new(&schema, &range, &["3"]);
+        let actual = QueryPlan::new(&schema, &range, &["3"], schema.key());
         assert_eq!(None, actual);
     }
 
@@ -628,27 +641,33 @@ mod test {
             },
             aux: vec![
                 (
-                    "1-0-2".to_string(),
+                    "0-2".to_string(),
                     TestIndex {
-                        columns: vec!["1", "0", "2"],
+                        columns: vec!["0", "2"],
                     },
                 ),
                 (
-                    "1-2-0".to_string(),
+                    "1-0".to_string(),
                     TestIndex {
-                        columns: vec!["1", "2", "0"],
+                        columns: vec!["1", "0"],
                     },
                 ),
                 (
-                    "2-0-1".to_string(),
+                    "1-2".to_string(),
                     TestIndex {
-                        columns: vec!["2", "0", "1"],
+                        columns: vec!["1", "2"],
                     },
                 ),
                 (
-                    "2-1-0".to_string(),
+                    "2-0".to_string(),
                     TestIndex {
-                        columns: vec!["2", "1", "0"],
+                        columns: vec!["2", "0"],
+                    },
+                ),
+                (
+                    "2-1".to_string(),
+                    TestIndex {
+                        columns: vec!["2", "1"],
                     },
                 ),
             ],
@@ -660,23 +679,32 @@ mod test {
         range.insert("1", (1..2).into());
 
         let expected = QueryPlan {
-            indices: smallvec![(
-                IndexId::Auxiliary("1-0-2"),
-                IndexQuery::new(&["1", "0", "2"], smallvec![&"1"], 2),
-            ),],
+            indices: smallvec![
+                (
+                    IndexId::Auxiliary("1-0"),
+                    IndexQuery::new(&["1", "0"], smallvec![&"1"], 2),
+                ),
+                (IndexId::Primary, IndexQuery::new(&["2"], smallvec![], 0),),
+            ],
         };
 
-        let actual = QueryPlan::new(&schema, &range, &["1", "0"]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &["1", "0"], schema.key()).expect("plan");
         assert_eq!(expected, actual);
 
         let expected = QueryPlan {
-            indices: smallvec![(
-                IndexId::Auxiliary("1-2-0"),
-                IndexQuery::new(&["1", "2", "0"], smallvec![&"1"], 3),
-            ),],
+            indices: smallvec![
+                (
+                    IndexId::Auxiliary("1-2"),
+                    IndexQuery::new(&["1", "2"], smallvec![&"1"], 2),
+                ),
+                (
+                    IndexId::Auxiliary("1-0"),
+                    IndexQuery::new(&["0"], smallvec![], 1),
+                ),
+            ],
         };
 
-        let actual = QueryPlan::new(&schema, &range, &["1", "2", "0"]).expect("plan");
+        let actual = QueryPlan::new(&schema, &range, &["1", "2", "0"], schema.key()).expect("plan");
         assert_eq!(expected, actual);
     }
 }

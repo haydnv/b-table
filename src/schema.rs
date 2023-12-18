@@ -342,8 +342,9 @@ impl<S: Schema> TableSchema<S> {
         &'a self,
         range: &HashMap<S::Id, ColumnRange<S::Value>>,
         order: &'a [S::Id],
+        select: &'a [S::Id],
     ) -> Result<QueryPlan<'a, S::Id>, io::Error> {
-        QueryPlan::new(self, &range, order).ok_or_else(|| {
+        QueryPlan::new(self, &range, order, select).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
