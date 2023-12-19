@@ -474,6 +474,7 @@ where
             .await
     }
 
+    // note: it would be clearer to implement this recursively but it would require removing the lifetime parameter
     async fn rows<'a>(
         &'a self,
         mut plan: QueryPlan<'a, IS::Id>,
@@ -490,9 +491,10 @@ where
         let last_query = plan.indices.pop();
 
         if let Some((index_id, query)) = plan.indices.first() {
+            assert_eq!(query.prefix_len(), 0);
             let index = self.get_index(*index_id).expect("index");
 
-            let columns = &index.schema().columns()[..query.selected(0)];
+            let columns = &index.schema().columns()[..query.selected()];
             assert!(query.range().iter().zip(columns).all(|(r, c)| *r == c));
 
             let index_range = index_range_for(&columns[..query.range().len()], &mut range);
@@ -512,15 +514,16 @@ where
 
             let (prefixes, columns_in) = keys.take().expect("prefixes");
 
-            let columns_out = &index.schema().columns()[..query.selected(columns_in.len())];
+            let columns_out = &index.schema().columns()[..query.selected()];
 
-            debug_assert!(columns_out.len() > columns_in.len());
+            assert_eq!(query.prefix_len(), columns_in.len());
+            assert!(columns_out.len() > columns_in.len());
+            assert!(query.range().iter().zip(columns_out).all(|(r, c)| *r == c));
+
             debug_assert!(columns_out
                 .iter()
                 .take(columns_in.len())
                 .all(|c| columns_in.contains(c)));
-
-            assert!(query.range().iter().zip(columns_out).all(|(r, c)| *r == c));
 
             let extract_prefix = prefix_extractor(columns_in, &columns_out[..columns_in.len()]);
 
@@ -545,6 +548,8 @@ where
         if let Some((index_id, query)) = last_query {
             if let Some((prefixes, columns_in)) = keys.take() {
                 // merge streams of all keys in the last index beginning with each prefix
+
+                assert_eq!(query.prefix_len(), columns_in.len());
 
                 let index = self.get_index(index_id).expect("index");
 
@@ -589,17 +594,10 @@ where
             }
         }
 
-        if let Some((keys, columns)) = keys {
+        let (keys, columns) = if let Some((keys, columns)) = keys {
             if select.iter().all(|c| columns.contains(c)) {
                 // if all columns to select are already present, return the stream
-
-                if columns == select {
-                    Ok(keys)
-                } else {
-                    let extract_prefix = prefix_extractor(columns, select);
-                    let rows = keys.map_ok(extract_prefix);
-                    Ok(Box::pin(rows))
-                }
+                (keys, columns)
             } else {
                 // otherwise, construct a stream of rows by extracting & selecting each primary key
 
@@ -615,23 +613,23 @@ where
                     .try_buffered(num_cpus::get())
                     .map_ok(|maybe_row| maybe_row.expect("row"));
 
-                Ok(Box::pin(rows))
+                let rows: Rows<IS::Value> = Box::pin(rows);
+                (rows, self.primary.schema().columns())
             }
         } else {
             let columns = self.primary.schema().columns();
             let index_range = index_range_for(columns, &mut range);
-
             assert!(range.is_empty());
-
             let keys = self.primary.clone().keys(index_range, reverse).await?;
+            (keys, columns)
+        };
 
-            if select == columns {
-                Ok(keys)
-            } else {
-                let extract_prefix = prefix_extractor(columns, select);
-                let rows = keys.map_ok(extract_prefix);
-                Ok(Box::pin(rows))
-            }
+        if columns == select {
+            Ok(keys)
+        } else {
+            let extract_prefix = prefix_extractor(columns, select);
+            let rows = keys.map_ok(extract_prefix);
+            Ok(Box::pin(rows))
         }
     }
 }
@@ -1220,6 +1218,13 @@ fn bad_key<V: fmt::Debug>(key: &[V], key_len: usize) -> io::Error {
 
 #[inline]
 fn valid_schema<S: Schema>(schema: &S) -> Result<(), io::Error> {
+    if schema.primary().columns().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{schema:?} contains no columns"),
+        ));
+    }
+
     for (index_name, index) in schema.auxiliary() {
         if index.columns().is_empty() {
             return Err(io::Error::new(
@@ -1233,6 +1238,18 @@ fn valid_schema<S: Schema>(schema: &S) -> Result<(), io::Error> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("index {index_name} refers to unknown column {col_name}"),
+                ));
+            }
+        }
+
+        // note: it's inefficient to remove this requirement
+        // because it would break the assumption
+        // that every key constructed by merging two indices exists in the primary index
+        for col_name in schema.key() {
+            if !index.columns().contains(col_name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("index {index_name} is missing primary key column {col_name}"),
                 ));
             }
         }
