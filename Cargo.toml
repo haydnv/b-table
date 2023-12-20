@@ -37,4 +37,4 @@ destream = "0.7"
 destream_json = { version = "0.12", features = ["value"] }
 number-general = "0.11"
 rand = "0.8"
-tokio = { version = "1.33", features = ["macros"] }
+tokio = { version = "1.35", features = ["macros"] }
