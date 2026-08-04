@@ -362,7 +362,7 @@ where
 
         let mut deletes = IndexStack::with_capacity(self.auxiliary.len() + 1);
 
-        for (_name, index) in self.auxiliary.iter_mut() {
+        for index in self.auxiliary.values_mut() {
             let index_key = borrow_columns(
                 &row,
                 self.primary.schema().columns(),
@@ -442,7 +442,7 @@ where
     pub(super) async fn upsert(&mut self, row: Vec<IS::Value>) -> Result<bool, io::Error> {
         let mut inserts = IndexStack::with_capacity(self.auxiliary.len() + 1);
 
-        for (_name, index) in self.auxiliary.iter_mut() {
+        for index in self.auxiliary.values_mut() {
             let index_key = clone_columns(
                 &row,
                 self.primary.schema().columns(),
