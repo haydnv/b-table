@@ -215,6 +215,120 @@ impl<K: Eq + Hash, V> Range<K, V> {
     }
 }
 
+impl<K: Clone + Eq + Hash, V: Clone> Range<K, V> {
+    /// Intersect this range with `other`, or return `None` if they are disjoint.
+    pub fn intersection<C>(&self, other: Self, collator: &C) -> Option<Self>
+    where
+        C: Collate<Value = V>,
+    {
+        let mut columns = self.columns.clone();
+        for (name, other) in other.columns {
+            let intersection = match columns.remove(&name) {
+                Some(this) => intersect_column(this, other, collator)?,
+                None => other,
+            };
+            columns.insert(name, intersection);
+        }
+        Some(Self { columns })
+    }
+}
+
+fn intersect_column<C>(
+    left: ColumnRange<C::Value>,
+    right: ColumnRange<C::Value>,
+    collator: &C,
+) -> Option<ColumnRange<C::Value>>
+where
+    C: Collate,
+    C::Value: Clone,
+{
+    match (left, right) {
+        (ColumnRange::Eq(left), ColumnRange::Eq(right)) => {
+            (collator.cmp(&left, &right) == Ordering::Equal).then_some(ColumnRange::Eq(left))
+        }
+        (ColumnRange::Eq(value), ColumnRange::In(bounds))
+        | (ColumnRange::In(bounds), ColumnRange::Eq(value)) => {
+            contains(&bounds, &value, collator).then_some(ColumnRange::Eq(value))
+        }
+        (ColumnRange::In(left), ColumnRange::In(right)) => {
+            let lower = max_lower(left.0, right.0, collator);
+            let upper = min_upper(left.1, right.1, collator);
+            valid_bounds(&lower, &upper, collator).then_some(ColumnRange::In((lower, upper)))
+        }
+    }
+}
+
+fn contains<C>(bounds: &(Bound<C::Value>, Bound<C::Value>), value: &C::Value, collator: &C) -> bool
+where
+    C: Collate,
+{
+    let above_lower = match &bounds.0 {
+        Bound::Unbounded => true,
+        Bound::Included(lower) => collator.cmp(value, lower) != Ordering::Less,
+        Bound::Excluded(lower) => collator.cmp(value, lower) == Ordering::Greater,
+    };
+    let below_upper = match &bounds.1 {
+        Bound::Unbounded => true,
+        Bound::Included(upper) => collator.cmp(value, upper) != Ordering::Greater,
+        Bound::Excluded(upper) => collator.cmp(value, upper) == Ordering::Less,
+    };
+    above_lower && below_upper
+}
+
+fn max_lower<C>(left: Bound<C::Value>, right: Bound<C::Value>, collator: &C) -> Bound<C::Value>
+where
+    C: Collate,
+{
+    match (&left, &right) {
+        (Bound::Unbounded, _) => right,
+        (_, Bound::Unbounded) => left,
+        (
+            Bound::Included(left_value) | Bound::Excluded(left_value),
+            Bound::Included(right_value) | Bound::Excluded(right_value),
+        ) => match collator.cmp(left_value, right_value) {
+            Ordering::Less => right,
+            Ordering::Greater => left,
+            Ordering::Equal if matches!(left, Bound::Excluded(_)) => left,
+            Ordering::Equal => right,
+        },
+    }
+}
+
+fn min_upper<C>(left: Bound<C::Value>, right: Bound<C::Value>, collator: &C) -> Bound<C::Value>
+where
+    C: Collate,
+{
+    match (&left, &right) {
+        (Bound::Unbounded, _) => right,
+        (_, Bound::Unbounded) => left,
+        (
+            Bound::Included(left_value) | Bound::Excluded(left_value),
+            Bound::Included(right_value) | Bound::Excluded(right_value),
+        ) => match collator.cmp(left_value, right_value) {
+            Ordering::Less => left,
+            Ordering::Greater => right,
+            Ordering::Equal if matches!(left, Bound::Excluded(_)) => left,
+            Ordering::Equal => right,
+        },
+    }
+}
+
+fn valid_bounds<C>(lower: &Bound<C::Value>, upper: &Bound<C::Value>, collator: &C) -> bool
+where
+    C: Collate,
+{
+    match (lower, upper) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => true,
+        (Bound::Included(lower), Bound::Included(upper)) => {
+            collator.cmp(lower, upper) != Ordering::Greater
+        }
+        (
+            Bound::Included(lower) | Bound::Excluded(lower),
+            Bound::Included(upper) | Bound::Excluded(upper),
+        ) => collator.cmp(lower, upper) == Ordering::Less,
+    }
+}
+
 impl<C, K> OverlapsRange<Self, C> for Range<K, C::Value>
 where
     K: Eq + Hash,
@@ -388,4 +502,35 @@ where
     }
 
     i == range.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn range(lower: Bound<u64>, upper: Bound<u64>) -> Range<&'static str, u64> {
+        [("id", ColumnRange::In((lower, upper)))]
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn range_intersection_preserves_the_narrowest_bounds() {
+        let outer = range(Bound::Included(1), Bound::Excluded(4));
+        let inner = range(Bound::Included(2), Bound::Excluded(3));
+        let intersection = outer
+            .intersection(inner, &Collator::default())
+            .expect("overlapping ranges");
+        assert_eq!(
+            intersection.get(&"id"),
+            Some(&ColumnRange::In((Bound::Included(2), Bound::Excluded(3))))
+        );
+    }
+
+    #[test]
+    fn range_intersection_rejects_disjoint_bounds() {
+        let outer = range(Bound::Included(1), Bound::Excluded(2));
+        let inner = range(Bound::Included(2), Bound::Excluded(3));
+        assert!(outer.intersection(inner, &Collator::default()).is_none());
+    }
 }
