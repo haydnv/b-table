@@ -192,7 +192,7 @@ async fn main() -> Result<(), io::Error> {
     let path = setup_tmp_dir().await?;
 
     // initialize the cache
-    let cache = Cache::<File>::new(BLOCK_SIZE, None);
+    let cache = Cache::<File>::new(BLOCK_SIZE, None, 0, std::time::Duration::from_secs(3));
 
     // load the directory and file paths into memory (not file contents, yet)
     let dir = cache.load(path.clone())?;
