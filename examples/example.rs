@@ -192,7 +192,7 @@ async fn main() -> Result<(), io::Error> {
     let path = setup_tmp_dir().await?;
 
     // initialize the cache
-    let cache = Cache::<File>::new(BLOCK_SIZE, None);
+    let cache = Cache::<File>::new(BLOCK_SIZE, None, 0, std::time::Duration::from_secs(3));
 
     // load the directory and file paths into memory (not file contents, yet)
     let dir = cache.load(path.clone())?;
@@ -206,14 +206,14 @@ async fn main() -> Result<(), io::Error> {
         ],
     );
 
-    let row1 = vec![
+    let row1 = [
         1.into(),
         "one".to_string().into(),
         9.into(),
         "nine".to_string().into(),
     ];
 
-    let row2 = vec![
+    let row2 = [
         2.into(),
         "two".to_string().into(),
         8.into(),
